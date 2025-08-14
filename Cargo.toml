@@ -1,0 +1,35 @@
+[package]
+name = "rubin_oxide"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rubin_oxide"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = {version = "0.24.0", features = ["extension-module"]}
+ndarray = {version="0.16", features = ["blas"]}
+ndarray-linalg = { version = "0.17"}
+numpy = "0.24"
+blas-src = { version = "0.10", features = ["openblas"] }
+openblas-src = { version = "0.10", features = ["cblas", "system"] }
+pyo3-log = "0.12.4"
+log = "0.4.27"
+
+[tool.maturin]
+python-source="python"
+
+# [profile.dev]
+# opt-level = 3
+# debug = false
+# strip = "none"
+# debug-assertions = false
+# overflow-checks = false
+# lto = true
+# panic = 'unwind'
+# incremental = false
+# codegen-units = 16
+# rpath = false
+

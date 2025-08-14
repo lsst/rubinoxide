@@ -1,3 +1,18 @@
-# Pytest configuration required to prevent pytest from looking for
-# configurations in parent directories. Can be empty.
-[tool.pytest.ini_options]
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rubin_oxide"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-packages = ['lsst']
+python-source = "python/"
+module-name = "lsst.rubin_oxide._rubin_oxide"

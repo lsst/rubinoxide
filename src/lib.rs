@@ -1,3 +1,4 @@
+/*
 For copyright information see the COPYRIGHT file included in the top-level
 directory of this distribution.
 
@@ -25,3 +26,16 @@ are permitted provided that the following conditions are met:
  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+use pyo3::prelude::*;
+
+mod rgb;
+
+/// A Python module to convert to/from oklab/rgb with specific colorspaces.
+#[pymodule]
+fn _rubin_oxide<'py>(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // initialize the logger such that rust logs get sent to python
+    pyo3_log::init();
+    rgb::create_rgb_module(&m)?;
+    Ok(())
+}
