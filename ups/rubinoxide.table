@@ -1,0 +1,6 @@
+# Setting CARGO_HOME is needed for shared environments where
+# the user might not have permission to write to the location
+# rust is installed. If the user installed rust themselves
+# this is the default location they would have gotten.
+envSet(CARGO_HOME, ${HOME}/.cargo/)
+envPrepend(PYTHONPATH, ${PRODUCT_DIR}/pylib)

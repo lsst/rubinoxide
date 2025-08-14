@@ -1,3 +1,153 @@
-# Pytest configuration required to prevent pytest from looking for
-# configurations in parent directories. Can be empty.
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rubinoxide"
+requires-python = ">=3.12"
+description = "Rust accelerated code for astronomical data processing."
+license =  "BSD-3-Clause OR GPL-3.0-or-later"
+license-files = ["COPYRIGHT", "LICENSE"]
+readme = "README.md"
+authors = [
+    {name="Rubin Observatory Data Management", email="dm-admin@lists.lsst.org"},
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dynamic = ["version"]
+
+[project.urls]
+"Homepage" = "https://github.com/lsst/rubinoxide"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-packages = ['lsst']
+python-source = "python/"
+module-name = "lsst.rubinoxide._rubinoxide"
+
+[tool.black]
+line-length = 110
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 110
+known_first_party = ["lsst"]
+
+[tool.lsst_versions]
+write_to = "python/lsst/rubinoxide/version.py"
+
 [tool.pytest.ini_options]
+# These require additional environment setup that isn't available during
+# normal unit test runs
+addopts = "--ignore=tests_integration"
+
+[tool.pydocstyle]
+convention = "numpy"
+# Our coding style does not require docstrings for magic methods (D105)
+# Our docstyle documents __init__ at the class level (D107)
+# We allow methods to inherit docstrings and this is not compatible with D102.
+# Docstring at the very first line is not required
+# D200, D205 and D400 all complain if the first sentence of the docstring does
+# not fit on one line. We do not require docstrings in __init__ files (D104).
+add-ignore = ["D107", "D105", "D102", "D100", "D200", "D205", "D400", "D104"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [
+    "__init__.py",
+]
+
+[tool.ruff.lint]
+ignore = [
+    "N802",
+    "N803",
+    "N806",
+    "N812",
+    "N815",
+    "N816",
+    "N999",
+    "D107",
+    "D105",
+    "D102",
+    "D104",
+    "D100",
+    "D200",
+    "D205",
+    "D400",
+    "UP007",  # Allow UNION in type annotation
+]
+select = [
+    "E",  # pycodestyle
+    "F",  # pycodestyle
+    "N",  # pep8-naming
+    "W",  # pycodestyle
+    "D",  # pydocstyle
+    "UP",  # pyupgrade
+    "I",  # isort
+    "RUF022",  # sort __all__
+]
+# Commented out to suppress "unused noqa" in jenkins which has older ruff not
+# generating E721.
+extend-select = [
+    "RUF100", # Warn about unused noqa
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["lsst"]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 79
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.format]
+docstring-code-format = true
+# Formatter does not know about indenting.
+docstring-code-line-length = 69
+
+[tool.towncrier]
+    package = "lsst.rubinoxide"
+    package_dir = "python"
+    filename = "doc/lsst.rubinoxide/CHANGES.rst"
+    directory = "doc/changes"
+    title_format = "Rubinoxide {version} ({project_date})"
+    issue_format = "`{issue} <https://rubinobs.atlassian.net/browse/{issue}>`_"
+
+    [[tool.towncrier.type]]
+        directory = "feature"
+        name = "New Features"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "api"
+        name = "API Changes"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "bugfix"
+        name = "Bug Fixes"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "perf"
+        name = "Performance Enhancement"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "misc"
+        name = "Other Changes and Additions"
+        showcontent = true
+
+    [[tool.towncrier.type]]
+        directory = "removal"
+        name = "An API Removal or Deprecation"
+        showcontent = true
