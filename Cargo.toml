@@ -10,26 +10,19 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = {version = "0.24.0", features = ["extension-module"]}
-ndarray = {version="0.16", features = ["blas"]}
+ndarray = {version="0.16", features = ["blas", "serde"]}
 ndarray-linalg = { version = "0.17"}
 numpy = "0.24"
 blas-src = { version = "0.10", features = ["openblas"] }
 openblas-src = { version = "0.10", features = ["cblas", "system"] }
 pyo3-log = "0.12.4"
 log = "0.4.27"
+ndarray-conv = "0.5.0"
+serde = { version = "1.0.228", features = ["serde_derive"]}
+serde_yml = "0.0.12"
+serde_json = { version = "1.0.145", features = ["float_roundtrip", "preserve_order"] }
+thiserror = "2.0.17"
 
 [tool.maturin]
 python-source="python"
-
-# [profile.dev]
-# opt-level = 3
-# debug = false
-# strip = "none"
-# debug-assertions = false
-# overflow-checks = false
-# lto = true
-# panic = 'unwind'
-# incremental = false
-# codegen-units = 16
-# rpath = false
 

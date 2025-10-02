@@ -20,7 +20,10 @@ clean:
 	rm -rf $(WHEEL_DIR)/*.whl
 
 build: clean
-	maturin build -r
+	# Turning manylinux off for default builds as it can cause bundling issues
+	# if we end up wanting it for pip packages or something it should be added
+	# as a seperate make target.
+	maturin build -r --manylinux off
 
 install: build
 	mkdir -p $(TARGET_DIR)

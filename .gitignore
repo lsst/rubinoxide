@@ -1,8 +1,9 @@
 # rust build products
 target/
 
-# Built by sconsUtils
-version.py
+# the pylib should not be committed
+pylib/
+
 bin/
 
 # Pytest
