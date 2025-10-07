@@ -1,6 +1,6 @@
 # lsst-rubin-oxide
 
-Utility code for the [Rubin Science Pipelines](https://pipelines.lsst.io) written in rust and bound to python with pyO3. The public api of the code is intended to be python only, the fact that most of the package is written in rust is an implementation detail for performance reasons.
+Utility code for the [Rubin Science Pipelines](https://pipelines.lsst.io) written in Rust and bound to Python with PyO3. The public API of the code is intended to be Python only; the fact that most of the package is written in Rust is an implementation detail for performance reasons.
 
 When this library is used through eups for local development developers should:
 * Clone the repo

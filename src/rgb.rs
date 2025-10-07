@@ -42,81 +42,61 @@ use numpy::{IntoPyArray, PyArray3, PyReadonlyArray3};
 use pyo3::prelude::*;
 
 // from CIE RGB to XYZ
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static RGB_TO_XYZ_MATRIX: [f64; 9] = [
-    4.86570949e-01,
-    2.65667693e-01,
-    1.98217285e-01,
-    2.28974564e-01,
-    6.91738522e-01,
-    7.92869141e-02,
-    -3.97207552e-17,
-    4.51133819e-02,
-    1.04394437e+00,
+    4.86570949e-01, 2.65667693e-01, 1.98217285e-01,
+    2.28974564e-01, 6.91738522e-01, 7.92869141e-02,
+    -3.97207552e-17, 4.51133819e-02, 1.04394437e+00,
 ];
 
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static XYZ_TO_RGB_MATRIX: [f64; 9] = [
-    2.49349691,
-    -0.93138362,
-    -0.40271078,
-    -0.82948897,
-    1.76266406,
-    0.02362469,
-    0.03584583,
-    -0.07617239,
-    0.95688452,
+    2.49349691, -0.93138362, -0.40271078,
+    -0.82948897, 1.76266406, 0.02362469,
+    0.03584583, -0.07617239, 0.95688452,
 ];
 
 // transfer function to shift whitepoint
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static CAT_BRADFORD: [f64; 9] = [
-    0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296,
+    0.8951, 0.2664, -0.1614,
+    -0.7502, 1.7135, 0.0367,
+    0.0389, -0.0685, 1.0296,
 ];
 
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static XYZ_TO_LMS: [f64; 9] = [
-    0.81893301,
-    0.36186674,
-    -0.12885971,
-    0.03298454,
-    0.92931187,
-    0.03614564,
-    0.0482003,
-    0.26436627,
-    0.63385171,
+    0.81893301, 0.36186674, -0.12885971,
+    0.03298454, 0.92931187, 0.03614564,
+    0.0482003, 0.26436627, 0.63385171,
 ];
 
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static LMS_TO_LAB: [f64; 9] = [
-    0.21045426,
-    0.79361779,
-    -0.00407205,
-    1.9779985,
-    -2.42859221,
-    0.45059371,
-    0.02590404,
-    0.78277177,
-    -0.80867577,
+    0.21045426, 0.79361779, -0.00407205,
+    1.9779985, -2.42859221, 0.45059371,
+    0.02590404, 0.78277177, -0.80867577,
 ];
 
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static LAB_TO_LMS: [f64; 9] = [
-    1.,
-    0.39633779,
-    0.21580376,
-    1.00000001,
-    -0.10556134,
-    -0.06385417,
-    1.00000005,
-    -0.08948418,
-    -1.29148554,
+    1., 0.39633779, 0.21580376,
+    1.00000001, -0.10556134, -0.06385417,
+    1.00000005, -0.08948418, -1.29148554,
 ];
 
+// keep rust fmt from re-formatting what is a 3x3 matrix
+#[rustfmt::skip]
 static LMS_TO_XYZ: [f64; 9] = [
-    1.22701385,
-    -0.55779998,
-    0.28125615,
-    -0.04058018,
-    1.11225687,
-    -0.07167668,
-    -0.07638128,
-    -0.42148198,
-    1.58616322,
+    1.22701385, -0.55779998, 0.28125615,
+    -0.04058018, 1.11225687, -0.07167668,
+    -0.07638128, -0.42148198, 1.58616322,
 ];
 
 // Transform coordinates in xy coordinates to XYZ coordinates
@@ -140,18 +120,19 @@ fn transform_whitepoint(from: &Array1<f64>, to: &Array1<f64>) -> Array2<f64> {
     M_CAT.dot(&M)
 }
 
-///Convert an image of RGB values into OKlab values
+/// Convert an image of RGB values into OKlab values
 ///
 /// The image format must be a 3D image with the rgb values along the third
-/// axis. The valuse must be double precision.
+/// axis. The values must be double precision.
 ///
 /// Parameters
 /// ----------
-/// image : array like
+/// image : array-like
 ///     A numpy array of 3 dimensions with the third dimension corresponding
 ///     to the rgb values in 0-1 range in double precision.
 /// illuminant_xyz : tuple of double
-///     the illuminant of the xyz space in xy coordinates
+///     the illuminant of the xyz space in xy coordinates. The first element is
+///     x, and the second is y.
 ///
 /// Returns
 /// -------
@@ -203,18 +184,19 @@ fn RGB_to_Oklab<'py>(
         .into_pyarray(py)
 }
 
-///Convert an image of Oklab values into RGB
+/// Convert an image of Oklab values into RGB
 ///
 /// The image format must be a 3D image with the oklab values along the third
-/// axis. The valuse must be double precision.
+/// axis. The values must be double precision.
 ///
 /// Parameters
 /// ----------
-/// image : array like
+/// image : array-like
 ///     A numpy array of 3 dimensions with the third dimension corresponding
 ///     to the oklab values
 /// illuminant_xyz : tuple of double
-///     the illuminant of the xyz space in xy coordinates
+///     the illuminant of the xyz space in xy coordinates. The first element is
+///     x, and the second is y.
 ///
 /// Returns
 /// -------

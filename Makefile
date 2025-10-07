@@ -3,7 +3,7 @@ WHEEL_DIR = target/wheels
 
 UNAME_S := $(shell uname -s)
 
-# Because we link again conda's openblass we need to tell conda test where
+# Because we link againstconda's openblas we need to tell conda test where
 # to find the library when it runs. This is a bit different on mac and
 # linux as the mac version of rust MUST run with the system libc++. This
 # means it must be first in the library search path.
@@ -22,7 +22,7 @@ clean:
 build: clean
 	# Turning manylinux off for default builds as it can cause bundling issues
 	# if we end up wanting it for pip packages or something it should be added
-	# as a seperate make target.
+	# as a separate make target.
 	maturin build -r --manylinux off
 
 install: build
