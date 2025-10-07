@@ -3,7 +3,7 @@ requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "rubin_oxide"
+name = "rubinoxide"
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
@@ -15,4 +15,4 @@ dynamic = ["version"]
 features = ["pyo3/extension-module"]
 python-packages = ['lsst']
 python-source = "python/"
-module-name = "lsst.rubin_oxide._rubin_oxide"
+module-name = "lsst.rubinoxide._rubinoxide"

@@ -913,7 +913,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rubin_oxide"
+name = "rubinoxide"
 version = "0.1.0"
 dependencies = [
  "blas-src",

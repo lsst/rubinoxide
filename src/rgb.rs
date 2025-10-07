@@ -264,7 +264,7 @@ fn Oklab_to_RGB<'py>(
         .into_pyarray(py)
 }
 
-// This function is called by the main python module rubin_oxide. Its job
+// This function is called by the main python module rubinoxide. Its job
 // is to create a new sub moduled named rgb, and bind the declared
 // pyfunctions to that module. Finally it adds this submodule into the main
 // module.

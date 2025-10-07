@@ -33,7 +33,7 @@ mod rgb;
 
 /// A Python module to convert to/from oklab/rgb with specific colorspaces.
 #[pymodule]
-fn _rubin_oxide<'py>(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rubinoxide<'py>(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // initialize the logger such that rust logs get sent to python
     pyo3_log::init();
     rgb::create_rgb_module(&m)?;

@@ -1,16 +1,16 @@
 .. py:currentmodule:: lsst.rubin.oxide
 
-.. _lsst.rubin_oxide:
+.. _lsst.rubinoxide:
 
 ################
-lsst.rubin_oxide
+lsst.rubinoxide
 ################
 
 .. Paragraph that describes what this Python module does and links to related modules and frameworks.
 
-.. .. _lsst.rubin_oxide-using:
+.. .. _lsst.rubinoxide-using:
 
-.. Using lsst.rubin_oxide
+.. Using lsst.rubinoxide
 .. ======================
 
 .. toctree linking to topics related to using the module's APIs.
@@ -18,20 +18,20 @@ lsst.rubin_oxide
 .. .. toctree::
 ..    :maxdepth: 1
 
-.. _lsst.rubin_oxide-contributing:
+.. _lsst.rubinoxide-contributing:
 
 Contributing
 ============
 
-``lsst.rubin_oxide`` is developed at https://github.com/lsst/rubin_oxide.
-You can find Jira issues for this module under the `rubin_oxide <https://jira.lsstcorp.org/issues/?jql=project%20%3D%20DM%20AND%20component%20%3D%20rubin_oxide>`_ component.
+``lsst.rubinoxide`` is developed at https://github.com/lsst/rubinoxide.
+You can find Jira issues for this module under the `rubinoxide <https://jira.lsstcorp.org/issues/?jql=project%20%3D%20DM%20AND%20component%20%3D%20rubinoxide>`_ component.
 
 .. If there are topics related to developing this module (rather than using it), link to this from a toctree placed here.
 
 .. .. toctree::
 ..    :maxdepth: 1
 
-.. .. _lsst.rubin_oxide-scripts:
+.. .. _lsst.rubinoxide-scripts:
 
 .. Script reference
 .. ================
@@ -41,11 +41,11 @@ You can find Jira issues for this module under the `rubin_oxide <https://jira.ls
 .. .. toctree::
 ..    :maxdepth: 1
 
-.. .. _lsst.rubin_oxide-pyapi:
+.. .. _lsst.rubinoxide-pyapi:
 
 Python API reference
 ====================
 
-.. automodapi:: lsst.rubin_oxide
+.. automodapi:: lsst.rubinoxide
    :no-main-docstr:
    :no-inheritance-diagram:
