@@ -30,6 +30,7 @@ are permitted provided that the following conditions are met:
 use pyo3::prelude::*;
 
 mod rgb;
+mod test_utils;
 
 /// A Python module to convert to/from oklab/rgb with specific colorspaces.
 #[pymodule]

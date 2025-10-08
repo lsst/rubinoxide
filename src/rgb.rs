@@ -156,6 +156,7 @@ fn RGB_to_Oklab<'py>(
     let cie_XYZ = xy_to_XYZ(illuminant_RGB);
     let wp_XYZ = xy_to_XYZ(cie_whitepoint);
     let new_whitepoint = transform_whitepoint(&cie_XYZ, &wp_XYZ);
+    println!("{cie_XYZ:?}, {wp_XYZ:?}, {new_whitepoint:?}");
 
     let rgb_transformation_matrix = ArrayView::from_shape((3, 3), &RGB_TO_XYZ_MATRIX).unwrap();
     let xyz_to_lms = ArrayView::from_shape((3, 3), &XYZ_TO_LMS).unwrap();
@@ -255,4 +256,46 @@ pub fn create_rgb_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     rgb_module.add_function(wrap_pyfunction!(Oklab_to_RGB, &rgb_module)?)?;
     rgb_module.add_function(wrap_pyfunction!(RGB_to_Oklab, &rgb_module)?)?;
     parent_module.add_submodule(&rgb_module)
+}
+
+// [0.9504300519709449, 1.0, 1.0888064918092575], shape=[3], strides=[1], layout=CFcf (0xf), const ndim=1, [0.96875, 1.0, 1.15625], shape=[3], strides=[1], layout=CFcf (0xf), const ndim=1, [[1.0043793665731358, 0.0035632174066636906, 0.009730332343152936],
+//  [0.006601130488117334, 0.9908373346742494, 0.0026531367645154552],
+//  [0.002706449232049499, -0.0050280810337089065, 1.064198091273342]], shape=[3, 3], strides=[3, 1], layout=Cc (0x5), const ndim=2
+
+#[cfg(test)]
+mod tests {
+    use ndarray::Zip;
+
+    use super::*;
+    use crate::test_utils::assert_delta;
+
+    #[test]
+    fn test_transform_whitepoint() {
+        let input_1 = ArrayView1::from_shape((3,), &[0.9504300519709449, 1.0, 1.0888064918092575])
+            .unwrap()
+            .to_owned();
+        let input_2 = ArrayView1::from_shape((3,), &[0.96875, 1.0, 1.15625])
+            .unwrap()
+            .to_owned();
+        let expected = ArrayView2::from_shape(
+            (3, 3),
+            &[
+                1.0043793665731358,
+                0.0035632174066636906,
+                0.009730332343152936,
+                0.006601130488117334,
+                0.9908373346742494,
+                0.0026531367645154552,
+                0.002706449232049499,
+                -0.0050280810337089065,
+                1.064198091273342,
+            ],
+        )
+        .unwrap();
+
+        let result = transform_whitepoint(&input_1, &input_2);
+        Zip::from(&result)
+            .and(&expected)
+            .for_each(|e, r| assert_delta!(e, r, 1e-5));
+    }
 }

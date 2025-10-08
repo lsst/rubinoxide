@@ -3,7 +3,7 @@ import numpy as np
 import unittest
 
 from lsst.rubinoxide import rgb
-from lsst.utils.tests import TestCase
+from lsst.utils.tests import TestCase, init, MemoryTestCase
 
 
 class RGBTestCase(TestCase):
@@ -23,3 +23,12 @@ class RGBTestCase(TestCase):
         round_trip = rgb.Oklab_to_RGB(oklab_values, whitepoint)
 
         np.testing.assert_allclose(round_trip, test_image, atol=1e-4, rtol=0)
+
+
+class MemoryTestCase(MemoryTestCase):
+    pass
+
+
+if __name__ == "__main__":
+    init()
+    unittest.main()

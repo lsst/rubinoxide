@@ -5,6 +5,7 @@ target/
 pylib/
 
 bin/
+tests/__pycache__/
 
 # Pytest
 tests/.tests
