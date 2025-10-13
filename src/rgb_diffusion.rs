@@ -686,6 +686,7 @@ fn diffuse_gray_image<'py>(
             sharpness: 0.0,
         };
         // Do all the points in the image in this function
+        let im_dim = array.dim();
         let process_points = (
             Array1::<usize>::from_iter(0..im_dim.0),
             Array1::<usize>::from_iter(0..im_dim.1),
