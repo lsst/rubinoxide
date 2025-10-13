@@ -30,6 +30,7 @@ are permitted provided that the following conditions are met:
 use pyo3::prelude::*;
 
 mod rgb;
+mod rgb_diffusion;
 mod test_utils;
 
 /// A Python module to convert to/from oklab/rgb with specific colorspaces.
@@ -38,5 +39,6 @@ fn _rubinoxide<'py>(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // initialize the logger such that rust logs get sent to python
     pyo3_log::init();
     rgb::create_rgb_module(&m)?;
+    rgb_diffusion::create_rgb_diffusion_module(&m)?;
     Ok(())
 }
