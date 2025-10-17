@@ -33,8 +33,11 @@ use ndarray::linalg::general_mat_mul;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, NdFloat};
 use ndarray_linalg::Inverse;
+use num_traits::Float;
 use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
+use rand;
+use rand_distr::{Distribution, Normal, StandardNormal};
 use std::cmp;
 
 const MAX_NUM_SCALES: usize = 10;
@@ -138,8 +141,6 @@ fn heat_PDE_diffusion<T: NdFloat + Default>(
     hf_input: ArrayView2<T>,
     lf_input: ArrayView2<T>,
     output: ArrayViewMut2<T>,
-    process_points: &(Array1<usize>, Array1<usize>),
-    passthrough_points: &(Array1<usize>, Array1<usize>),
     mult: usize,
     anisotropy: [T; 4],
     isotropy_type: [IsotropyType; 4],
@@ -148,6 +149,7 @@ fn heat_PDE_diffusion<T: NdFloat + Default>(
     current_radius_sq: T,
     ABCD: [T; 4],
     strength: T,
+    mask: &Option<ArrayView2<bool>>,
 ) {
     let mut output = output;
     let regularization_factor = regularization * current_radius_sq / T::from(9.0).unwrap();
@@ -161,117 +163,120 @@ fn heat_PDE_diffusion<T: NdFloat + Default>(
 
     let (height, width) = output.dim();
 
-    for row in &process_points.0 {
-        i_neighbours[0] = (cmp::max(*row as i32 - (mult * H) as i32, 0) as i32) as usize;
-        i_neighbours[1] = *row;
-        i_neighbours[2] = cmp::min((*row + mult * H) as i32, height as i32 - 1) as usize;
-        for col in &process_points.1 {
-            j_neighbours[0] = cmp::max(*col as i32 - (mult * H) as i32, 0) as usize;
-            j_neighbours[1] = *col;
-            j_neighbours[2] = cmp::min((*col + mult * H) as i32, width as i32 - 1) as usize;
+    // for row in &process_points.0 {
+    for row in 0..height {
+        i_neighbours[0] = (cmp::max(row as i32 - (mult * H) as i32, 0) as i32) as usize;
+        i_neighbours[1] = row;
+        i_neighbours[2] = cmp::min((row + mult * H) as i32, height as i32 - 1) as usize;
+        // for col in &process_points.1 {
+        for col in 0..width {
+            j_neighbours[0] = cmp::max(col as i32 - (mult * H) as i32, 0) as usize;
+            j_neighbours[1] = col;
+            j_neighbours[2] = cmp::min((col + mult * H) as i32, width as i32 - 1) as usize;
 
-            for ii in 0..3 {
-                for jj in 0..3 {
-                    neighbour_pixel_hf[3 * ii + jj] =
-                        hf_input[(i_neighbours[ii], j_neighbours[jj])];
-                    neighbour_pixel_lf[3 * ii + jj] =
-                        lf_input[(i_neighbours[ii], j_neighbours[jj])];
+            let do_pixel = match mask {
+                Some(m) => m[(row, col)],
+                None => true,
+            };
+
+            if do_pixel {
+                for ii in 0..3 {
+                    for jj in 0..3 {
+                        neighbour_pixel_hf[3 * ii + jj] =
+                            hf_input[(i_neighbours[ii], j_neighbours[jj])];
+                        neighbour_pixel_lf[3 * ii + jj] =
+                            lf_input[(i_neighbours[ii], j_neighbours[jj])];
+                    }
                 }
-            }
 
-            let mut gradient = find_gradients(neighbour_pixel_lf);
-            let mut laplace = find_gradients(neighbour_pixel_hf);
+                let mut gradient = find_gradients(neighbour_pixel_lf);
+                let mut laplace = find_gradients(neighbour_pixel_hf);
 
-            let magnitude_grad = (gradient[0].powi(2) + gradient[1].powi(2)).sqrt();
-            c2[0] = -magnitude_grad * anisotropy[0];
-            c2[2] = -magnitude_grad * anisotropy[2];
+                let magnitude_grad = (gradient[0].powi(2) + gradient[1].powi(2)).sqrt();
+                c2[0] = -magnitude_grad * anisotropy[0];
+                c2[2] = -magnitude_grad * anisotropy[2];
 
-            if magnitude_grad != T::default() {
-                gradient[0] /= magnitude_grad;
-                gradient[1] /= magnitude_grad;
+                if magnitude_grad != T::default() {
+                    gradient[0] /= magnitude_grad;
+                    gradient[1] /= magnitude_grad;
+                } else {
+                    gradient[0] = T::from(1.0).unwrap();
+                    gradient[1] = T::default();
+                }
+                let cos_theta_grad_sq = gradient[0].powi(2);
+                let sin_theta_grad_sq = gradient[1].powi(2);
+                let cos_theta_sin_theta_grad = gradient[0] * gradient[1];
+
+                let magnitude_lapl = (laplace[0].powi(2) + laplace[1].powi(2)).sqrt();
+                c2[1] = -magnitude_lapl * anisotropy[1];
+                c2[3] = -magnitude_lapl * anisotropy[3];
+
+                if magnitude_lapl != T::default() {
+                    laplace[0] /= magnitude_lapl;
+                    laplace[1] /= magnitude_lapl;
+                } else {
+                    laplace[0] = T::from(1.0).unwrap();
+                    laplace[1] = T::default();
+                }
+
+                let cos_theta_lapl_sq = laplace[0].powi(2);
+                let sin_theta_lapl_sq = laplace[1].powi(2);
+                let cos_theta_sin_theta_lapl = laplace[0] * laplace[1];
+
+                for k in 0..4 {
+                    c2[k] = c2[k].exp();
+                }
+                let kern_first = compute_kernel(
+                    c2[0],
+                    cos_theta_sin_theta_grad,
+                    cos_theta_grad_sq,
+                    sin_theta_grad_sq,
+                    &isotropy_type[0],
+                );
+                let kern_second = compute_kernel(
+                    c2[1],
+                    cos_theta_sin_theta_lapl,
+                    cos_theta_lapl_sq,
+                    sin_theta_lapl_sq,
+                    &isotropy_type[1],
+                );
+                let kern_third = compute_kernel(
+                    c2[2],
+                    cos_theta_sin_theta_grad,
+                    cos_theta_grad_sq,
+                    sin_theta_grad_sq,
+                    &isotropy_type[2],
+                );
+                let kern_fourth = compute_kernel(
+                    c2[3],
+                    cos_theta_sin_theta_lapl,
+                    cos_theta_lapl_sq,
+                    sin_theta_lapl_sq,
+                    &isotropy_type[3],
+                );
+
+                let mut derivatives: [T; 4] = [T::default(); 4];
+                let mut variance = T::default();
+                for k in 0..9 {
+                    derivatives[0] += kern_first[k] * neighbour_pixel_lf[k];
+                    derivatives[1] += kern_second[k] * neighbour_pixel_lf[k];
+                    derivatives[2] += kern_third[k] * neighbour_pixel_hf[k];
+                    derivatives[3] += kern_fourth[k] * neighbour_pixel_hf[k];
+                    variance += neighbour_pixel_hf[k].powi(2);
+                }
+
+                variance = variance_threshold + variance * regularization_factor;
+
+                let mut acc = T::default();
+                for k in 0..4 {
+                    acc += derivatives[k] * ABCD[k];
+                }
+
+                acc = hf_input[(row, col)] * strength + acc / variance;
+                output[(row, col)] = (acc + lf_input[(row, col)]).max(T::default());
             } else {
-                gradient[0] = T::from(1.0).unwrap();
-                gradient[1] = T::default();
+                output[(row, col)] = hf_input[(row, col)] + lf_input[(row, col)];
             }
-            let cos_theta_grad_sq = gradient[0].powi(2);
-            let sin_theta_grad_sq = gradient[1].powi(2);
-            let cos_theta_sin_theta_grad = gradient[0] * gradient[1];
-
-            let magnitude_lapl = (laplace[0].powi(2) + laplace[1].powi(2)).sqrt();
-            c2[1] = -magnitude_lapl * anisotropy[1];
-            c2[3] = -magnitude_lapl * anisotropy[3];
-
-            if magnitude_lapl != T::default() {
-                laplace[0] /= magnitude_lapl;
-                laplace[1] /= magnitude_lapl;
-            } else {
-                laplace[0] = T::from(1.0).unwrap();
-                laplace[1] = T::default();
-            }
-
-            let cos_theta_lapl_sq = laplace[0].powi(2);
-            let sin_theta_lapl_sq = laplace[1].powi(2);
-            let cos_theta_sin_theta_lapl = laplace[0] * laplace[1];
-
-            for k in 0..4 {
-                c2[k] = c2[k].exp();
-            }
-            let kern_first = compute_kernel(
-                c2[0],
-                cos_theta_sin_theta_grad,
-                cos_theta_grad_sq,
-                sin_theta_grad_sq,
-                &isotropy_type[0],
-            );
-            let kern_second = compute_kernel(
-                c2[1],
-                cos_theta_sin_theta_lapl,
-                cos_theta_lapl_sq,
-                sin_theta_lapl_sq,
-                &isotropy_type[1],
-            );
-            let kern_third = compute_kernel(
-                c2[2],
-                cos_theta_sin_theta_grad,
-                cos_theta_grad_sq,
-                sin_theta_grad_sq,
-                &isotropy_type[2],
-            );
-            let kern_fourth = compute_kernel(
-                c2[3],
-                cos_theta_sin_theta_lapl,
-                cos_theta_lapl_sq,
-                sin_theta_lapl_sq,
-                &isotropy_type[3],
-            );
-
-            let mut derivatives: [T; 4] = [T::default(); 4];
-            let mut variance = T::default();
-            for k in 0..9 {
-                derivatives[0] += kern_first[k] * neighbour_pixel_lf[k];
-                derivatives[1] += kern_second[k] * neighbour_pixel_lf[k];
-                derivatives[2] += kern_third[k] * neighbour_pixel_hf[k];
-                derivatives[3] += kern_fourth[k] * neighbour_pixel_hf[k];
-                variance += neighbour_pixel_hf[k].powi(2);
-            }
-
-            variance = variance_threshold + variance * regularization_factor;
-
-            let mut acc = T::default();
-            for k in 0..4 {
-                acc += derivatives[k] * ABCD[k];
-            }
-
-            acc = hf_input[(*row, *col)] * strength + acc / variance;
-            output[(*row, *col)] = (acc + lf_input[(*row, *col)]).max(T::default());
-        }
-    }
-
-    // These points should not be modified just reconstruct the output
-    for row in &passthrough_points.0 {
-        for col in &passthrough_points.1 {
-            output[(*row, *col)] = hf_input[(*row, *col)] + lf_input[(*row, *col)];
-            panic!("This should not be reachablefor now");
         }
     }
 }
@@ -427,8 +432,7 @@ fn wavelets_process<T: NdFloat + Default>(
     lf_even: &mut Array2<T>,
     hf: &mut Vec<Array2<T>>,
     zoom: T,
-    process_points: &(Array1<usize>, Array1<usize>),
-    passthrough_points: &(Array1<usize>, Array1<usize>),
+    mask: &Option<ArrayView2<bool>>,
 ) {
     let anisotropy = [
         compute_anisotropy_factor(process_args.anisotropy_first),
@@ -532,8 +536,6 @@ fn wavelets_process<T: NdFloat + Default>(
             hf[scale].view(),
             buffer_in,
             buffer_out,
-            &process_points,
-            &passthrough_points,
             mult,
             anisotropy,
             isotropy_type,
@@ -542,6 +544,7 @@ fn wavelets_process<T: NdFloat + Default>(
             current_radius.powi(2),
             ABCD,
             strength,
+            mask,
         );
     }
 }
@@ -567,8 +570,7 @@ struct ProcessArgs<T: NdFloat + Default> {
 fn process_image<T: NdFloat + Default>(
     process_args: ProcessArgs<T>,
     image_in: &mut ArrayViewMut2<T>,
-    process_points: (Array1<usize>, Array1<usize>),
-    passthrough_points: (Array1<usize>, Array1<usize>),
+    mask: Option<ArrayView2<bool>>,
 ) -> Array2<T> {
     let im_dim = image_in.dim();
     let mut image_out = Array2::<T>::zeros(image_in.dim());
@@ -616,8 +618,7 @@ fn process_image<T: NdFloat + Default>(
                 &mut lf_even,
                 &mut hf,
                 zoom,
-                &process_points,
-                &passthrough_points,
+                &mask,
             );
         } else if (it % 2) == 0 {
             if it == (iterations - 1) {
@@ -634,8 +635,7 @@ fn process_image<T: NdFloat + Default>(
                 &mut lf_even,
                 &mut hf,
                 zoom,
-                &process_points,
-                &passthrough_points,
+                &mask,
             );
         } else {
             if it == (iterations - 1) {
@@ -652,8 +652,7 @@ fn process_image<T: NdFloat + Default>(
                 &mut lf_even,
                 &mut hf,
                 zoom,
-                &process_points,
-                &passthrough_points,
+                &mask,
             );
         }
     }
@@ -694,28 +693,10 @@ fn diffuse_gray_image<'py>(
     fourth: f64,
     radius: f64,
     sharpness: f64,
-    // iterations: usize,
 ) -> Bound<'py, PyArray2<f64>> {
     unsafe {
         let mut array = image.as_array_mut();
 
-        // let process_args = ProcessArgs {
-        //     iterations: 15,
-        //     anisotropy_first: 1.0,
-        //     anisotropy_second: 1.0,
-        //     anisotropy_third: 1.0,
-        //     anisotropy_fourth: 1.0,
-        //     regularization: 2.94,
-        //     variance_threshold: 0.0,
-        //     radius_center: 0.0,
-        //     first: 0.0065,
-        //     second: -0.25,
-        //     third: -0.25,
-        //     fourth: -0.2774,
-        //     radius: 5.0,
-        //     sharpness: 0.0,
-        // };
-        //
         let process_args = ProcessArgs {
             iterations,
             anisotropy_first,
@@ -732,21 +713,100 @@ fn diffuse_gray_image<'py>(
             radius,
             sharpness,
         };
-        // Do all the points in the image in this function
-        let im_dim = array.dim();
-        let process_points = (
-            Array1::<usize>::from_iter(0..im_dim.0),
-            Array1::<usize>::from_iter(0..im_dim.1),
-        );
-        let passthrough_points = (Array1::<usize>::zeros(0), Array1::<usize>::zeros(0));
-        let result = process_image(process_args, &mut array, process_points, passthrough_points);
+        let result = process_image(process_args, &mut array, None);
         result.to_pyarray(py)
     }
+}
+
+fn replace_masked_with_noise<T: NdFloat + Default>(
+    image: ArrayView2<T>,
+    mask: &ArrayView2<bool>,
+) -> Array2<T>
+where
+    StandardNormal: Distribution<T>,
+{
+    let im_dim = image.dim();
+    let mut result = Array2::<T>::zeros(im_dim);
+    for i in 0..im_dim.0 {
+        for j in 0..im_dim.1 {
+            let val = image[(i, j)];
+            result[(i, j)] = if mask[(i, j)] {
+                let normal = Normal::new(val, val).unwrap();
+
+                normal.sample(&mut rand::rng())
+            } else {
+                image[(i, j)]
+            }
+        }
+    }
+    result
+}
+
+#[pyfunction]
+#[pyo3(signature = (image,
+    mask,
+    iterations= 32,
+    anisotropy_first= 0.0,
+    anisotropy_second= 0.0,
+    anisotropy_third= 0.0,
+    anisotropy_fourth= 2.0,
+    regularization= 0.0,
+    variance_threshold= 0.0,
+    radius_center= 0.0,
+    first= 0.0,
+    second= 0.0,
+    third= 0.0,
+    fourth= 1.0,
+    radius= 5.0,
+    sharpness= 0.0,
+))]
+fn inpaint_mask<'py>(
+    py: Python<'py>,
+    image: PyReadonlyArray2<f64>,
+    mask: PyReadonlyArray2<bool>,
+    iterations: usize,
+    anisotropy_first: f64,
+    anisotropy_second: f64,
+    anisotropy_third: f64,
+    anisotropy_fourth: f64,
+    regularization: f64,
+    variance_threshold: f64,
+    radius_center: f64,
+    first: f64,
+    second: f64,
+    third: f64,
+    fourth: f64,
+    radius: f64,
+    sharpness: f64,
+) -> Bound<'py, PyArray2<f64>> {
+    let array = image.as_array();
+    let mask_array = mask.as_array();
+
+    let process_args = ProcessArgs {
+        iterations,
+        anisotropy_first,
+        anisotropy_second,
+        anisotropy_third,
+        anisotropy_fourth,
+        regularization,
+        variance_threshold,
+        radius_center,
+        first,
+        second,
+        third,
+        fourth,
+        radius,
+        sharpness,
+    };
+    let mut masked = replace_masked_with_noise(array, &mask_array);
+    let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
+    result.to_pyarray(py)
 }
 
 pub fn create_rgb_diffusion_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let rgb_diffusion_module = PyModule::new(parent_module.py(), "rgb_diffusion")?;
     rgb_diffusion_module
         .add_function(wrap_pyfunction!(diffuse_gray_image, &rgb_diffusion_module)?)?;
+    rgb_diffusion_module.add_function(wrap_pyfunction!(inpaint_mask, &rgb_diffusion_module)?)?;
     parent_module.add_submodule(&rgb_diffusion_module)
 }
