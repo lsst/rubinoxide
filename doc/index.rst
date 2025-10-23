@@ -1,5 +1,5 @@
 #################################
-rubin_oxide documentation preview
+rubinoxide documentation preview
 #################################
 
 .. This page is for local development only. It isn't published to pipelines.lsst.io.
@@ -9,4 +9,4 @@ rubin_oxide documentation preview
 .. toctree::
    :maxdepth: 1
 
-   lsst.rubin.oxide/index
+   lsst.rubinoxide/index

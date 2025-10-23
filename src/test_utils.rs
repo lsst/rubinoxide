@@ -1,3 +1,4 @@
+/*
 For copyright information see the COPYRIGHT file included in the top-level
 directory of this distribution.
 
@@ -25,3 +26,29 @@ are permitted provided that the following conditions are met:
  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*! This module is a place to put test utilities that will be used
+throughout the whole crate.
+*/
+
+// allow unused_macros below because this macro is expected to be used in other
+// parts of the crate.
+
+/// Use this macro in tests to compare two numberes to be within some delta
+#[allow(unused_macros)]
+macro_rules! assert_delta {
+    ($x:expr, $y:expr, $d:expr) => {
+        if !($x - $y < $d && $y - $x < $d) {
+            panic!(
+                "value {} is different than {} by greater than {} delta",
+                $x, $y, $d
+            );
+        }
+    };
+}
+
+// This is a trick to make the macro accessable through the normal
+// module::function syntax
+#[allow(unused_imports)]
+pub(crate) use assert_delta;
