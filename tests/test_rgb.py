@@ -60,9 +60,11 @@ class RGBTestCase(TestCase):
 class MemoryTestCase(MemoryTestCase):
     """Test for memory leaks"""
 
-    ignore_regexps = [".*build[.]log.*", ".*build[.]msg.*"]
-
     pass
+
+
+def setup_module(module):
+    init()
 
 
 if __name__ == "__main__":
