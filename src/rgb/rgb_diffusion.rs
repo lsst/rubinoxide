@@ -29,12 +29,9 @@ are permitted provided that the following conditions are met:
  */
 extern crate openblas_src;
 use log;
-use ndarray::linalg::general_mat_mul;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, NdFloat};
-use ndarray_linalg::Inverse;
-use num_traits::Float;
-use numpy::{IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand;
 use rand_distr::{Distribution, Normal, StandardNormal};
@@ -137,7 +134,7 @@ fn compute_kernel<T: NdFloat + Default>(
     }
 }
 
-fn heat_PDE_diffusion<T: NdFloat + Default>(
+fn heat_pde_diffusion<T: NdFloat + Default>(
     hf_input: ArrayView2<T>,
     lf_input: ArrayView2<T>,
     output: ArrayViewMut2<T>,
@@ -147,7 +144,7 @@ fn heat_PDE_diffusion<T: NdFloat + Default>(
     variance_threshold: T,
     regularization: T,
     current_radius_sq: T,
-    ABCD: [T; 4],
+    abcd: [T; 4],
     strength: T,
     mask: &Option<ArrayView2<bool>>,
 ) {
@@ -269,7 +266,7 @@ fn heat_PDE_diffusion<T: NdFloat + Default>(
 
                 let mut acc = T::default();
                 for k in 0..4 {
-                    acc += derivatives[k] * ABCD[k];
+                    acc += derivatives[k] * abcd[k];
                 }
 
                 acc = hf_input[(row, col)] * strength + acc / variance;
@@ -376,7 +373,7 @@ fn _bspline_horizontal<T: NdFloat + Default>(
 }
 
 #[inline]
-fn decompose_2D_Bspline<T: NdFloat + Default>(
+fn decompose_2d_bspline<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
     hf: ArrayViewMut2<T>,
     lf: ArrayViewMut2<T>,
@@ -475,7 +472,7 @@ fn wavelets_process<T: NdFloat + Default>(
             buffer_out = lf_odd.view_mut();
         }
 
-        decompose_2D_Bspline(
+        decompose_2d_bspline(
             buffer_in,
             hf[sc].view_mut(),
             buffer_out,
@@ -509,7 +506,7 @@ fn wavelets_process<T: NdFloat + Default>(
         let real_radius = current_radius * zoom;
         let norm =
             (-(real_radius - process_args.radius_center).powi(2) / process_args.radius).exp();
-        let ABCD = [
+        let abcd = [
             process_args.first * kappa * norm,
             process_args.second * kappa * norm,
             process_args.third * kappa * norm,
@@ -532,7 +529,7 @@ fn wavelets_process<T: NdFloat + Default>(
             buffer_out = reconstructed.view_mut();
         }
 
-        heat_PDE_diffusion(
+        heat_pde_diffusion(
             hf[scale].view(),
             buffer_in,
             buffer_out,
@@ -542,7 +539,7 @@ fn wavelets_process<T: NdFloat + Default>(
             variance_threshold,
             regularization,
             current_radius.powi(2),
-            ABCD,
+            abcd,
             strength,
             mask,
         );
@@ -572,7 +569,6 @@ fn process_image<T: NdFloat + Default>(
     image_in: &mut ArrayViewMut2<T>,
     mask: Option<ArrayView2<bool>>,
 ) -> Array2<T> {
-    let im_dim = image_in.dim();
     let mut image_out = Array2::<T>::zeros(image_in.dim());
     let mut temp_1 = Array2::<T>::zeros(image_in.dim());
     let mut temp_2 = Array2::<T>::zeros(image_in.dim());
@@ -592,6 +588,7 @@ fn process_image<T: NdFloat + Default>(
 
     let zoom = T::from(1.0).unwrap();
 
+    // let im_dim = image_in.dim();
     // let passthrough_points = (Array1::<usize>::zeros(0), Array1::<usize>::zeros(0));
     // let process_points = (
     //     Array1::<usize>::from_iter(0..im_dim.0),
@@ -676,7 +673,7 @@ fn process_image<T: NdFloat + Default>(
     radius= 5.0,
     sharpness= 0.0,
 ))]
-fn diffuse_gray_image<'py>(
+pub fn diffuse_gray_image<'py>(
     py: Python<'py>,
     image: PyReadonlyArray2<f64>,
     iterations: usize,
@@ -694,28 +691,27 @@ fn diffuse_gray_image<'py>(
     radius: f64,
     sharpness: f64,
 ) -> Bound<'py, PyArray2<f64>> {
-    unsafe {
-        let mut array = image.as_array_mut();
+    // TODO: revisit this interface to see if I strictly need this as mut
+    let mut array = unsafe { image.as_array_mut() };
 
-        let process_args = ProcessArgs {
-            iterations,
-            anisotropy_first,
-            anisotropy_second,
-            anisotropy_third,
-            anisotropy_fourth,
-            regularization,
-            variance_threshold,
-            radius_center,
-            first,
-            second,
-            third,
-            fourth,
-            radius,
-            sharpness,
-        };
-        let result = process_image(process_args, &mut array, None);
-        result.to_pyarray(py)
-    }
+    let process_args = ProcessArgs {
+        iterations,
+        anisotropy_first,
+        anisotropy_second,
+        anisotropy_third,
+        anisotropy_fourth,
+        regularization,
+        variance_threshold,
+        radius_center,
+        first,
+        second,
+        third,
+        fourth,
+        radius,
+        sharpness,
+    };
+    let result = process_image(process_args, &mut array, None);
+    result.to_pyarray(py)
 }
 
 fn replace_masked_with_noise<T: NdFloat + Default>(
@@ -760,7 +756,7 @@ where
     radius= 5.0,
     sharpness= 0.0,
 ))]
-fn inpaint_mask<'py>(
+pub fn inpaint_mask<'py>(
     py: Python<'py>,
     image: PyReadonlyArray2<f64>,
     mask: PyReadonlyArray2<bool>,
@@ -781,6 +777,10 @@ fn inpaint_mask<'py>(
 ) -> Bound<'py, PyArray2<f64>> {
     let array = image.as_array();
     let mask_array = mask.as_array();
+    log::debug!(
+        "Inpainting mask with {} pixels",
+        mask_array.iter().fold(0, |acc, &b| acc + b as usize)
+    );
 
     let process_args = ProcessArgs {
         iterations,
@@ -801,12 +801,4 @@ fn inpaint_mask<'py>(
     let mut masked = replace_masked_with_noise(array, &mask_array);
     let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
     result.to_pyarray(py)
-}
-
-pub fn create_rgb_diffusion_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
-    let rgb_diffusion_module = PyModule::new(parent_module.py(), "rgb_diffusion")?;
-    rgb_diffusion_module
-        .add_function(wrap_pyfunction!(diffuse_gray_image, &rgb_diffusion_module)?)?;
-    rgb_diffusion_module.add_function(wrap_pyfunction!(inpaint_mask, &rgb_diffusion_module)?)?;
-    parent_module.add_submodule(&rgb_diffusion_module)
 }
