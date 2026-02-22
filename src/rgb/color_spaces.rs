@@ -159,7 +159,6 @@ pub fn RGB_to_Oklab<'py>(
     let cie_XYZ = xy_to_XYZ(illuminant_RGB);
     let wp_XYZ = xy_to_XYZ(cie_whitepoint);
     let new_whitepoint = transform_whitepoint(&cie_XYZ, &wp_XYZ);
-    println!("{cie_XYZ:?}, {wp_XYZ:?}, {new_whitepoint:?}");
 
     let rgb_transformation_matrix = ArrayView::from_shape((3, 3), &RGB_TO_XYZ_MATRIX).unwrap();
     let xyz_to_lms = ArrayView::from_shape((3, 3), &XYZ_TO_LMS).unwrap();
