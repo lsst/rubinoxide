@@ -27,7 +27,8 @@ are permitted provided that the following conditions are met:
  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-extern crate openblas_src;
+// extern crate openblas_src;
+extern crate blas_sys;
 use log;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, NdFloat};

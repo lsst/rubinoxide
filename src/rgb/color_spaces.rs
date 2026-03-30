@@ -36,7 +36,10 @@ Color space conversion functions for RGB images are defined in this module.
 // Compile warnings should be suppressed for this module.
 #![allow(non_snake_case)]
 
-extern crate openblas_src;
+// extern crate openblas_src;
+extern crate blas_sys;
+// extern crate blis_src;
+use libm::cbrt;
 use ndarray::linalg::general_mat_mul;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2};
@@ -50,7 +53,8 @@ use pyo3::prelude::*;
 static RGB_TO_XYZ_MATRIX: [f64; 9] = [
     4.86570949e-01, 2.65667693e-01, 1.98217285e-01,
     2.28974564e-01, 6.91738522e-01, 7.92869141e-02,
-    -3.97207552e-17, 4.51133819e-02, 1.04394437e+00,
+    // -3.97207552e-17, 4.51133819e-02, 1.04394437e+00,
+    0.0, 4.51133819e-02, 1.04394437e+00,
 ];
 
 // keep rust fmt from re-formatting what is a 3x3 matrix
@@ -179,7 +183,8 @@ pub fn RGB_to_Oklab<'py>(
         .into_shape_with_order([height * width, depth])
         .unwrap();
     general_mat_mul(1.0, &reshaped, &(combined.t()), 0.0, &mut scratch);
-    scratch.map_inplace(|x| *x = x.signum() * x.abs().powf(pow));
+    scratch.map_inplace(|x| *x = x.signum() * cbrt(x.abs()));
+
     general_mat_mul(1.0, &scratch, &(lms_to_lab.t()), 0.0, &mut output);
     output
         .into_shape_with_order((height, width, depth))
