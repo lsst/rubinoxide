@@ -29,6 +29,7 @@ are permitted provided that the following conditions are met:
  */
 use pyo3::prelude::*;
 
+mod rbf_interpolator;
 mod rgb;
 mod test_utils;
 
@@ -37,6 +38,7 @@ mod test_utils;
 fn _rubinoxide<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
     // initialize the logger such that rust logs get sent to python
     pyo3_log::init();
+    rbf_interpolator::create_rbf_module(&m)?;
     rgb::create_rgb_module(&m)?;
     Ok(())
 }
