@@ -86,6 +86,7 @@ def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple):
 
     # Polynomial coefficients
     powers = np.ascontiguousarray(rbf_interp.powers, dtype=np.int64)
+    powers = powers[:, ::-1]
 
     # --- 2. Prepare data for Rust ---
     # PyO3 works best with Vec<f64> or similar contiguous arrays.
