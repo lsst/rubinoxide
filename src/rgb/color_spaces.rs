@@ -42,7 +42,12 @@ use ndarray::prelude::*;
 use ndarray::{Array1, Array2};
 use ndarray_linalg::Inverse;
 use numpy::{IntoPyArray, PyArray3, PyReadonlyArray3};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
+
+/// D65 standard illuminant whitepoint (CIE 1931)
+/// Used as the RGB working space whitepoint in this implementation
+const D65_WHITEPOINT: [f64; 2] = [0.31272, 0.32903];
 
 // from CIE RGB to XYZ
 // keep rust fmt from re-formatting what is a 3x3 matrix
@@ -103,24 +108,36 @@ static LMS_TO_XYZ: [f64; 9] = [
 ];
 
 // Transform coordinates in xy coordinates to XYZ coordinates
-fn xy_to_XYZ(white_point: [f64; 2]) -> Array1<f64> {
+fn xy_to_XYZ(white_point: [f64; 2]) -> Result<Array1<f64>, &'static str> {
+    if (white_point[1]).abs() < 1e-15 {
+        return Err("Whitepoint y-coordinate cannot be zero");
+    }
     let cie_Y_y = 1.0 / white_point[1];
-    array![
+    Ok(array![
         white_point[0] * cie_Y_y,
         1.0,
         (1.0 - (white_point[0] + white_point[1])) * cie_Y_y
-    ]
+    ])
 }
 
 // Transfrom from one whitepoint to another
-fn transform_whitepoint(from: &Array1<f64>, to: &Array1<f64>) -> Array2<f64> {
-    let M = ArrayView::from_shape((3, 3), &CAT_BRADFORD).unwrap();
+fn transform_whitepoint(from: &Array1<f64>, to: &Array1<f64>) -> Result<Array2<f64>, &'static str> {
+    let M = ArrayView::from_shape((3, 3), &CAT_BRADFORD)
+        .map_err(|_| "CAT_BRADFORD matrix must be 3x3")?;
     let RGB_w = M.dot(from);
     let RGB_wr = M.dot(to);
+
+    if RGB_w.iter().any(|&x| x.abs() < 1e-15) {
+        return Err("Source whitepoint XYZ values too close to zero");
+    }
+
     let div = RGB_wr / RGB_w;
     let D = Array2::from_diag(&div);
-    let M_CAT = M.inv().unwrap().dot(&D);
-    M_CAT.dot(&M)
+    let M_CAT = M
+        .inv()
+        .map_err(|_| "CAT_BRADFORD matrix is singular and cannot be inverted")?
+        .dot(&D);
+    Ok(M_CAT.dot(&M))
 }
 
 /// Convert an image of RGB values into OKlab values
@@ -147,22 +164,32 @@ pub fn RGB_to_Oklab<'py>(
     py: Python<'py>,
     image: PyReadonlyArray3<f64>,
     cie_whitepoint: [f64; 2],
-) -> Bound<'py, PyArray3<f64>> {
+) -> Result<Bound<'py, PyArray3<f64>>, PyErr> {
     log::debug!("Converting RGB image to Oklab colorspace\n");
-    let illuminant_RGB = [0.31272, 0.32903];
 
     let working_array = image.as_array();
     let (height, width, depth) = working_array.dim();
+
+    if depth != 3 {
+        return Err(PyTypeError::new_err(format!(
+            "Input image must have 3 channels, got {}",
+            depth
+        )));
+    }
+
     let mut output: Array2<f64> = Array2::zeros([height * width, depth]);
     let mut scratch: Array2<f64> = Array2::zeros([height * width, depth]);
 
-    let cie_XYZ = xy_to_XYZ(illuminant_RGB);
-    let wp_XYZ = xy_to_XYZ(cie_whitepoint);
-    let new_whitepoint = transform_whitepoint(&cie_XYZ, &wp_XYZ);
+    let cie_XYZ = xy_to_XYZ(D65_WHITEPOINT).map_err(PyTypeError::new_err)?;
+    let wp_XYZ = xy_to_XYZ(cie_whitepoint).map_err(PyTypeError::new_err)?;
+    let new_whitepoint = transform_whitepoint(&cie_XYZ, &wp_XYZ).map_err(PyTypeError::new_err)?;
 
-    let rgb_transformation_matrix = ArrayView::from_shape((3, 3), &RGB_TO_XYZ_MATRIX).unwrap();
-    let xyz_to_lms = ArrayView::from_shape((3, 3), &XYZ_TO_LMS).unwrap();
-    let lms_to_lab = ArrayView::from_shape((3, 3), &LMS_TO_LAB).unwrap();
+    let rgb_transformation_matrix = ArrayView::from_shape((3, 3), &RGB_TO_XYZ_MATRIX)
+        .map_err(|_| PyTypeError::new_err("RGB_TO_XYZ_MATRIX must be 3x3"))?;
+    let xyz_to_lms = ArrayView::from_shape((3, 3), &XYZ_TO_LMS)
+        .map_err(|_| PyTypeError::new_err("XYZ_TO_LMS matrix must be 3x3"))?;
+    let lms_to_lab = ArrayView::from_shape((3, 3), &LMS_TO_LAB)
+        .map_err(|_| PyTypeError::new_err("LMS_TO_LAB matrix must be 3x3"))?;
 
     // convert RGB to XYZ
     // shift the whitepoint
@@ -177,14 +204,17 @@ pub fn RGB_to_Oklab<'py>(
     // shape.
     let reshaped = working_array
         .into_shape_with_order([height * width, depth])
-        .unwrap();
+        .map_err(|_| PyTypeError::new_err("First reshape failed"))?;
     general_mat_mul(1.0, &reshaped, &(combined.t()), 0.0, &mut scratch);
     scratch.map_inplace(|x| *x = x.signum() * x.abs().powf(pow));
     general_mat_mul(1.0, &scratch, &(lms_to_lab.t()), 0.0, &mut output);
-    output
+
+    let result_array = output
         .into_shape_with_order((height, width, depth))
-        .unwrap()
-        .into_pyarray(py)
+        .map_err(|_| PyTypeError::new_err("Second reshape failed"))?
+        .into_pyarray(py);
+
+    Ok(result_array)
 }
 
 /// Convert an image of Oklab values into RGB
@@ -211,24 +241,33 @@ pub fn Oklab_to_RGB<'py>(
     py: Python<'py>,
     image: PyReadonlyArray3<f64>,
     illuminant_xyz: [f64; 2],
-) -> Bound<'py, PyArray3<f64>> {
+) -> Result<Bound<'py, PyArray3<f64>>, PyErr> {
     log::debug!("Converting Oklab image to RGB colorspace\n");
+
     let working_array = image.as_array();
     let (height, width, depth) = working_array.dim();
 
-    // pre allocate array
+    if depth != 3 {
+        return Err(PyTypeError::new_err(format!(
+            "Input image must have 3 channels, got {}",
+            depth
+        )));
+    }
+
     let mut output: Array2<f64> = Array2::zeros([height * width, depth]);
     let mut scratch: Array2<f64> = Array2::zeros([height * width, depth]);
 
-    let illuminant_D65 = [0.31272, 0.32903];
-    let cie_whitepiont = xy_to_XYZ(illuminant_xyz);
-    let cie_d65 = xy_to_XYZ(illuminant_D65);
-    let whitepoint_trans_matrix = transform_whitepoint(&cie_whitepiont, &cie_d65);
+    let cie_whitepoint = xy_to_XYZ(illuminant_xyz).map_err(PyTypeError::new_err)?;
+    let cie_d65 = xy_to_XYZ(D65_WHITEPOINT).map_err(PyTypeError::new_err)?;
+    let whitepoint_trans_matrix =
+        transform_whitepoint(&cie_whitepoint, &cie_d65).map_err(PyTypeError::new_err)?;
 
-    let lab_to_lms = ArrayView::from_shape((3, 3), &LAB_TO_LMS).unwrap();
-    let lms_to_xyz = ArrayView::from_shape((3, 3), &LMS_TO_XYZ).unwrap();
-
-    let xyz_to_rgb = ArrayView::from_shape((3, 3), &XYZ_TO_RGB_MATRIX).unwrap();
+    let lab_to_lms = ArrayView::from_shape((3, 3), &LAB_TO_LMS)
+        .map_err(|_| PyTypeError::new_err("LAB_TO_LMS matrix must be 3x3"))?;
+    let lms_to_xyz = ArrayView::from_shape((3, 3), &LMS_TO_XYZ)
+        .map_err(|_| PyTypeError::new_err("LMS_TO_XYZ matrix must be 3x3"))?;
+    let xyz_to_rgb = ArrayView::from_shape((3, 3), &XYZ_TO_RGB_MATRIX)
+        .map_err(|_| PyTypeError::new_err("XYZ_TO_RGB_MATRIX must be 3x3"))?;
 
     let combined = xyz_to_rgb.dot(&(whitepoint_trans_matrix.dot(&lms_to_xyz)));
 
@@ -239,14 +278,17 @@ pub fn Oklab_to_RGB<'py>(
     // shape.
     let reshaped = working_array
         .into_shape_with_order([height * width, depth])
-        .expect("first reshape failed\n");
+        .map_err(|_| PyTypeError::new_err("First reshape failed"))?;
     general_mat_mul(1.0, &reshaped, &(lab_to_lms.t()), 0.0, &mut scratch);
     scratch.mapv_inplace(|x| x.powf(3.0));
     general_mat_mul(1.0, &scratch, &(combined.t()), 0.0, &mut output);
-    output
+
+    let result_array = output
         .into_shape_with_order([height, width, depth])
-        .expect("second reshape failed\n")
-        .into_pyarray(py)
+        .map_err(|_| PyTypeError::new_err("Second reshape failed"))?
+        .into_pyarray(py);
+
+    Ok(result_array)
 }
 
 #[cfg(test)]
@@ -259,10 +301,10 @@ mod tests {
     #[test]
     fn test_transform_whitepoint() {
         let input_1 = ArrayView1::from_shape((3,), &[0.9504300519709449, 1.0, 1.0888064918092575])
-            .unwrap()
+            .expect("Test setup: input_1 must be 3-element array")
             .to_owned();
         let input_2 = ArrayView1::from_shape((3,), &[0.96875, 1.0, 1.15625])
-            .unwrap()
+            .expect("Test setup: input_2 must be 3-element array")
             .to_owned();
         let expected = ArrayView2::from_shape(
             (3, 3),
@@ -278,9 +320,10 @@ mod tests {
                 1.064198091273342,
             ],
         )
-        .unwrap();
+        .expect("Test setup: expected must be 3x3 array");
 
-        let result = transform_whitepoint(&input_1, &input_2);
+        let result = transform_whitepoint(&input_1, &input_2)
+            .expect("Test: transform_whitepoint should succeed");
         Zip::from(&result)
             .and(&expected)
             .for_each(|e, r| assert_delta!(e, r, 1e-5));

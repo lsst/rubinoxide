@@ -29,8 +29,7 @@ are permitted provided that the following conditions are met:
  */
 extern crate openblas_src;
 use log;
-use ndarray::prelude::*;
-use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, NdFloat};
+use ndarray::{Array2, ArrayView2, ArrayViewMut2, NdFloat};
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand;
@@ -42,7 +41,14 @@ const B_SPLINE_SIGMA: f64 = 2.0553651328015339;
 const H: usize = 1;
 const KAPPA: f64 = 0.25;
 
-#[derive(Clone, Copy)]
+/// Types of anisotropic diffusion behavior
+///
+/// Determines how diffusion responds to image gradients and edges.
+///
+/// * `Isotrope` - Uniform diffusion in all directions (isotropic)
+/// * `Isophote` - Diffusion perpendicular to isophotes (edges)
+/// * `Gradient` - Diffusion aligned with gradient direction
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum IsotropyType {
     Isotrope,
     Isophote,
@@ -57,6 +63,14 @@ fn find_gradients<T: NdFloat + Default>(pixels: [T; 9]) -> [T; 2] {
     ]
 }
 
+/// Generate isotropic Laplacian kernel for diffusion
+///
+/// Returns a 3×3 kernel (9 values in row-major order) that computes
+/// the Laplacian with edge-preserving properties. The center coefficient
+/// is negative to implement the Laplacian operator: Σ(neighbor - center)
+///
+/// # Returns
+/// * `[T; 9]` - Kernel coefficients in row-major order
 #[inline]
 fn isotrop_laplacian<T: NdFloat + Default>() -> [T; 9] {
     [
@@ -72,6 +86,20 @@ fn isotrop_laplacian<T: NdFloat + Default>() -> [T; 9] {
     ]
 }
 
+/// Compute rotation matrix for isophote-based anisotropic diffusion
+///
+/// Generates a 2×2 rotation matrix that aligns diffusion perpendicular
+/// to image isophotes (lines of constant intensity). This preserves edges
+/// while smoothing along the isophote direction.
+///
+/// # Arguments
+/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
+/// * `cos_theta_sin_theta` - Product of normalized gradient components
+/// * `cos_theta2` - Square of normalized x-gradient
+/// * `sin_theta2` - Square of normalized y-gradient
+///
+/// # Returns
+/// * `[[T; 2]; 2]` - 2×2 rotation matrix
 #[inline]
 fn rotation_matrix_isophote<T: NdFloat + Default>(
     c2: T,
@@ -87,6 +115,20 @@ fn rotation_matrix_isophote<T: NdFloat + Default>(
     a
 }
 
+/// Compute rotation matrix for gradient-based anisotropic diffusion
+///
+/// Generates a 2×2 rotation matrix that aligns diffusion with the image
+/// gradient direction. This smooths in the direction of greatest change
+/// while preserving perpendicular features.
+///
+/// # Arguments
+/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
+/// * `cos_theta_sin_theta` - Product of normalized gradient components
+/// * `cos_theta2` - Square of normalized x-gradient
+/// * `sin_theta2` - Square of normalized y-gradient
+///
+/// # Returns
+/// * `[[T; 2]; 2]` - 2×2 rotation matrix
 #[inline]
 fn rotation_matrix_gradient<T: NdFloat + Default>(
     c2: T,
@@ -102,6 +144,18 @@ fn rotation_matrix_gradient<T: NdFloat + Default>(
     a
 }
 
+/// Build 3×3 diffusion kernel from 2×2 rotation matrix
+///
+/// Converts a rotation matrix derived from image gradients into a
+/// 3×3 convolution kernel for anisotropic diffusion. The kernel
+/// incorporates the rotation information to create directionally-
+/// dependent diffusion behavior.
+///
+/// # Arguments
+/// * `a` - 2×2 rotation matrix encoding gradient information
+///
+/// # Returns
+/// * `[T; 9]` - 3×3 kernel coefficients in row-major order
 #[inline]
 fn build_matrix<T: NdFloat + Default>(a: [[T; 2]; 2]) -> [T; 9] {
     let b11 = a[0][1] / T::from(2.0).unwrap();
@@ -111,6 +165,21 @@ fn build_matrix<T: NdFloat + Default>(a: [[T; 2]; 2]) -> [T; 9] {
     [b11, a[1][1], b13, a[0][0], b22, a[0][0], b13, a[1][1], b11]
 }
 
+/// Compute 3×3 diffusion kernel based on isotropy type
+///
+/// Selects and constructs the appropriate kernel for anisotropic diffusion
+/// based on the specified isotropy type. The kernel encodes directional
+/// diffusion behavior derived from image structure tensors.
+///
+/// # Arguments
+/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
+/// * `cos_theta_sin_theta` - Cross product of normalized gradient
+/// * `cos_theta2` - Square of normalized x-gradient
+/// * `sin_theta2` - Square of normalized y-gradient
+/// * `isotropy_type` - Type of anisotropic behavior to apply
+///
+/// # Returns
+/// * `[T; 9]` - 3×3 kernel coefficients in row-major order
 #[inline]
 fn compute_kernel<T: NdFloat + Default>(
     c2: T,
@@ -134,6 +203,37 @@ fn compute_kernel<T: NdFloat + Default>(
     }
 }
 
+/// Apply anisotropic diffusion PDE to image subregions using four-derivative approach
+///
+/// Implements the heat equation with variable diffusion coefficients:
+///
+///     ∂u/∂t = ∇·(c(x,y,∇u)∇u)
+///
+/// where c(x,y,∇u) = exp(-|∇u| * anisotropy) controls edge preservation.
+/// High gradient regions (edges) have low diffusion coefficients, while
+/// flat regions diffuse more strongly.
+///
+/// The four-derivative approach captures directional information:
+/// [0,2] - Gradient-based diffusion (horizontal/vertical components)
+/// [1,3] - Laplacian-based diffusion (diagonal components)
+///
+/// # Arguments
+/// * `hf_input` - High-frequency component (wavelet detail coefficients)
+/// * `lf_input` - Low-frequency component (wavelet approximation)
+/// * `output` - Output array, modified in-place
+/// * `mult` - Scale multiplier (1<<scale), determines neighborhood size
+/// * `anisotropy` - Anisotropy parameters for four diffusion terms
+/// * `isotropy_type` - Isotropy mode for each of four terms
+/// * `variance_threshold` - Minimum variance for numerical stability
+/// * `regularization` - Regularization parameter
+/// * `current_radius_sq` - Current scale radius squared
+/// * `abcd` - Four diffusion coefficients weighted by position
+/// * `strength` - Overall diffusion strength multiplier
+/// * `mask` - Optional boolean mask for selective pixel processing
+///
+/// # Notes
+/// The diffusion coefficient computation: c = exp(-|∇u| * anisotropy)
+/// ensures edge preservation: high gradient = low diffusion.
 fn heat_pde_diffusion<T: NdFloat + Default>(
     hf_input: ArrayView2<T>,
     lf_input: ArrayView2<T>,
@@ -297,6 +397,23 @@ fn check_isotropy_mode<T: NdFloat + Default>(anisotropy: T) -> IsotropyType {
 // #[inline]
 // fn sparse_scalar_product()
 
+/// Perform vertical B-spline convolution pass on image
+///
+/// Applies a 5-tap binomial filter [1,4,6,4,1]/16 to convolve the image
+/// vertically at a multi-scale level determined by `mult`. The results
+/// are written to the output buffer.
+///
+/// The B-spline filter approximates Gaussian convolution with:
+/// [1/16, 4/16, 6/16, 4/16, 1/16]
+///
+/// # Arguments
+/// * `in_array` - Input image array
+/// * `row` - Current row being processed
+/// * `width` - Image width
+/// * `height` - Image height
+/// * `mult` - Multiplier for filter support (1<<scale level)
+/// * `clip_negatives` - If true, clamp negative results to zero
+/// * `out_buf` - Output buffer (length = width), receives filtered row
 #[inline]
 fn _bspline_vertical_pass<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
@@ -305,7 +422,8 @@ fn _bspline_vertical_pass<T: NdFloat + Default>(
     height: usize,
     mult: i32,
     clip_negatives: bool,
-) -> Array1<T> {
+    out_buf: &mut [T],
+) {
     let irow = row as i32;
     let indicies: [usize; 5] = [
         cmp::max(irow - 2 * mult, 0) as usize,
@@ -323,23 +441,35 @@ fn _bspline_vertical_pass<T: NdFloat + Default>(
         T::from(1.0 / 16.0).unwrap(),
     ];
 
-    (0..width)
-        .map(|index| {
-            let val_sum = (0..5).fold(T::default(), |acc, k| {
-                acc + in_array[(indicies[k], index)] * filter[k]
-            });
-            if clip_negatives {
-                val_sum.max(T::default())
-            } else {
-                val_sum
-            }
-        })
-        .collect::<Array1<T>>()
+    for index in 0..width {
+        let val_sum = (0..5).fold(T::default(), |acc, k| {
+            acc + in_array[(indicies[k], index)] * filter[k]
+        });
+        out_buf[index] = if clip_negatives {
+            val_sum.max(T::default())
+        } else {
+            val_sum
+        };
+    }
 }
 
+/// Perform horizontal B-spline convolution on a 1D slice
+///
+/// Applies a 5-tap binomial filter to convolve horizontally.
+/// Complements `_bspline_vertical_pass` for 2D decomposition.
+///
+/// # Arguments
+/// * `in_slice` - 1D input array (row to filter)
+/// * `col` - Current column position
+/// * `width` - Array width
+/// * `mult` - Multiplier for filter support (1<<scale)
+/// * `clip_negatives` - If true, clamp negative results to zero
+///
+/// # Returns
+/// * `T` - Filtered value at column position
 #[inline]
 fn _bspline_horizontal<T: NdFloat + Default>(
-    in_array: &ArrayViewMut1<T>,
+    in_slice: &[T],
     col: usize,
     width: usize,
     mult: i32,
@@ -363,7 +493,7 @@ fn _bspline_horizontal<T: NdFloat + Default>(
     ];
 
     let val_sum = (0..5).fold(T::default(), |acc, k| {
-        acc + in_array[indicies[k]] * filter[k]
+        acc + in_slice[indicies[k]] * filter[k]
     });
     if clip_negatives {
         val_sum.max(T::default())
@@ -372,6 +502,20 @@ fn _bspline_horizontal<T: NdFloat + Default>(
     }
 }
 
+/// Decompose image into high/low frequency components using 2D B-spline
+///
+/// Performs separable B-spline wavelet decomposition by applying
+/// vertical then horizontal passes. Produces high-frequency (detail)
+/// and low-frequency (approximation) components.
+///
+/// # Arguments
+/// * `in_array` - Input image (modified in-place for efficiency)
+/// * `hf` - High-frequency output array (details)
+/// * `lf` - Low-frequency output array (approximation)
+/// * `width` - Image width
+/// * `height` - Image height
+/// * `mult` - Scale multiplier (1<<scale)
+/// * `row_buf` - Reusable buffer for vertical pass results
 #[inline]
 fn decompose_2d_bspline<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
@@ -380,15 +524,15 @@ fn decompose_2d_bspline<T: NdFloat + Default>(
     width: usize,
     height: usize,
     mult: i32,
+    row_buf: &mut [T],
 ) {
     let mut hf = hf;
     let mut lf = lf;
     let mut in_array = in_array;
     for row in 0..height {
-        let mut row_conv =
-            _bspline_vertical_pass(in_array.view_mut(), row, width, height, mult, true);
+        _bspline_vertical_pass(in_array.view_mut(), row, width, height, mult, true, row_buf);
         for col in 0..width {
-            let blur = _bspline_horizontal(&row_conv.view_mut(), col, width, mult, true);
+            let blur = _bspline_horizontal(row_buf, col, width, mult, true);
             let index = (row, col);
             lf[index] = blur;
             hf[index] = in_array[index] - blur;
@@ -396,6 +540,17 @@ fn decompose_2d_bspline<T: NdFloat + Default>(
     }
 }
 
+/// Compute equivalent standard deviation at wavelet decomposition step
+///
+/// Calculates the cumulative Gaussian width after `s` steps of B-spline
+/// decomposition. Each step doubles the effective scale.
+///
+/// # Arguments
+/// * `sigma` - Base standard deviation (B_SPLINE_SIGMA)
+/// * `s` - Decomposition step (0 = base scale)
+///
+/// # Returns
+/// * `T` - Cumulative equivalent sigma at step s
 #[inline]
 fn equivalent_sigma_at_step<T: NdFloat + Default>(sigma: T, s: usize) -> T {
     if s == 0 {
@@ -407,6 +562,17 @@ fn equivalent_sigma_at_step<T: NdFloat + Default>(sigma: T, s: usize) -> T {
     }
 }
 
+/// Calculate number of wavelet decomposition steps for target sigma
+///
+/// Determines how many B-spline decomposition levels are needed
+/// to achieve a specified effective smoothing scale.
+///
+/// # Arguments
+/// * `sigma_filter` - Base filter standard deviation
+/// * `sigma_final` - Target equivalent sigma
+///
+/// # Returns
+/// * `usize` - Number of decomposition steps required
 #[inline]
 fn num_steps_to_reach_equivalent_sigma<T: NdFloat + Default>(
     sigma_filter: T,
@@ -420,6 +586,27 @@ fn num_steps_to_reach_equivalent_sigma<T: NdFloat + Default>(
     }
     s + 1
 }
+/// Process image through multi-scale wavelet decomposition and diffusion
+///
+/// Orchestrates the complete diffusion pipeline:
+/// 1. Decomposes image into high/low frequency components at each scale
+/// 2. Applies anisotropic diffusion to high-frequency components
+/// 3. Reconstructs image by combining processed components
+///
+/// Uses ping-pong buffering between `lf_odd` and `lf_even` arrays to
+/// avoid excessive allocations during multi-scale decomposition.
+///
+/// # Arguments
+/// * `process_args` - All diffusion algorithm parameters
+/// * `scales` - Number of wavelet decomposition levels
+/// * `input` - Input image, modified during processing
+/// * `reconstructed` - Final output image
+/// * `lf_odd` - Low-frequency buffer for odd scales
+/// * `lf_even` - Low-frequency buffer for even scales
+/// * `hf` - High-frequency components for each scale
+/// * `zoom` - Scaling factor for radius computation
+/// * `mask` - Optional boolean mask for selective processing
+/// * `row_buf` - Pre-allocated buffer for B-spline passes
 fn wavelets_process<T: NdFloat + Default>(
     process_args: &ProcessArgs<T>,
     scales: usize,
@@ -430,6 +617,7 @@ fn wavelets_process<T: NdFloat + Default>(
     hf: &mut Vec<Array2<T>>,
     zoom: T,
     mask: &Option<ArrayView2<bool>>,
+    row_buf: &mut [T],
 ) {
     let anisotropy = [
         compute_anisotropy_factor(process_args.anisotropy_first),
@@ -479,6 +667,7 @@ fn wavelets_process<T: NdFloat + Default>(
             width,
             height,
             mult,
+            row_buf,
         );
 
         final_scale = sc;
@@ -546,8 +735,12 @@ fn wavelets_process<T: NdFloat + Default>(
     }
 }
 
+/// Parameters for diffusion algorithm configuration
+///
+/// Encapsulates all tunable parameters for the anisotropic diffusion
+/// algorithm, including anisotropy weights, diffusion coefficients,
+/// and scale parameters.
 struct ProcessArgs<T: NdFloat + Default> {
-    // mask: Option<(Array1<usize>, Array1<usize>)>,
     iterations: usize,
     anisotropy_first: T,
     anisotropy_second: T,
@@ -564,6 +757,27 @@ struct ProcessArgs<T: NdFloat + Default> {
     sharpness: T,
 }
 
+/// Apply complete anisotropic diffusion pipeline to image
+///
+/// This is the top-level function that processes an image through
+/// multiple iterations of wavelet decomposition and diffusion:
+///
+/// 1. Allocates working buffers (temp arrays, low-freq buffers, high-freq buffers)
+/// 2. Computes required wavelet decomposition scales based on radius
+/// 3. Iterates diffusion process, alternating between buffers
+/// 4. Returns final diffused image
+///
+/// # Arguments
+/// * `process_args` - Complete diffusion configuration
+/// * `image_in` - Input image (modified during processing)
+/// * `mask` - Optional boolean mask for selective pixel processing
+///
+/// # Returns
+/// * `Array2<T>` - Diffused image
+///
+/// # Notes
+/// The number of iterations is clamped to minimum 1 to ensure
+/// at least one diffusion pass is always performed.
 fn process_image<T: NdFloat + Default>(
     process_args: ProcessArgs<T>,
     image_in: &mut ArrayViewMut2<T>,
@@ -588,12 +802,11 @@ fn process_image<T: NdFloat + Default>(
 
     let zoom = T::from(1.0).unwrap();
 
-    // let im_dim = image_in.dim();
-    // let passthrough_points = (Array1::<usize>::zeros(0), Array1::<usize>::zeros(0));
-    // let process_points = (
-    //     Array1::<usize>::from_iter(0..im_dim.0),
-    //     Array1::<usize>::from_iter(0..im_dim.1),
-    // );
+    // Get image dimensions for buffer allocation
+    let (_, width) = image_in.dim();
+
+    // Pre-allocate buffer for B-spline vertical pass to avoid heap allocations
+    let mut row_buf = vec![T::default(); width];
 
     let temp_1_ref = &mut temp_1.view_mut();
     let temp_2_ref = &mut temp_2.view_mut();
@@ -616,6 +829,7 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                &mut row_buf,
             );
         } else if (it % 2) == 0 {
             if it == (iterations - 1) {
@@ -633,6 +847,7 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                &mut row_buf,
             );
         } else {
             if it == (iterations - 1) {
@@ -650,12 +865,103 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                &mut row_buf,
             );
         }
     }
     image_out
 }
 
+/// Apply anisotropic diffusion to a grayscale image using multi-scale
+/// B-spline wavelet decomposition and PDE-based diffusion.
+///
+/// This function implements the heat equation with variable diffusion
+/// coefficients controlled by image structure tensors:
+///
+///     ∂u/∂t = ∇·(c(x,y,∇u)∇u)
+///
+/// where c(x,y,∇u) = exp(-|∇u| * anisotropy) is the diffusion coefficient.
+/// High gradient regions (edges) have low diffusion coefficients, preserving
+/// edges while smoothing flat regions.
+///
+/// The algorithm uses a four-derivative approach to capture directional
+/// information in both gradient and Laplacian domains, providing superior
+/// edge preservation compared to isotropic diffusion.
+///
+/// Parameters
+/// ----------
+/// image : `NDArray`
+///     Input grayscale image as 2D numpy array of dtype float64.
+/// iterations : `int`, optional
+///     Number of diffusion iterations. Higher values produce more
+///     diffusion. Default is 3.
+/// anisotropy_first : `float`, optional
+///     Diffusion strength for gradient-based first directional derivative.
+///     Values > 0 enable edge-preserving anisotropic diffusion.
+///     Default is 1.0.
+/// anisotropy_second : `float`, optional
+///     Diffusion strength for Laplacian-based second directional derivative.
+///     Default is 1.0.
+/// anisotropy_third : `float`, optional
+///     Diffusion strength for third directional derivative term.
+///     Default is 1.0.
+/// anisotropy_fourth : `float`, optional
+///     Diffusion strength for fourth directional derivative term.
+///     Default is 1.0.
+/// regularization : `float`, optional
+///     Regularization parameter for numerical stability. Controls minimum
+///     variance threshold. Default is 2.94.
+/// variance_threshold : `float`, optional
+///     Minimum variance threshold added to diffusion computation.
+///     Prevents division by zero. Default is 0.0.
+/// radius_center : `float`, optional
+///     Center radius for diffusion weighting. Determines scale of diffusion
+///     effects. Default is 0.0.
+/// first : `float`, optional
+///     First diffusion coefficient (weighted by position). Default is 0.0065.
+/// second : `float`, optional
+///     Second diffusion coefficient. Default is -0.25.
+/// third : `float`, optional
+///     Third diffusion coefficient. Default is -0.25.
+/// fourth : `float`, optional
+///     Fourth diffusion coefficient. Default is -0.2774.
+/// radius : `float`, optional
+///     Diffusion radius parameter. Larger values increase diffusion scale.
+///     Default is 5.0.
+/// sharpness : `float`, optional
+///     Sharpness enhancement parameter. Positive values preserve peaks,
+///     negative values smooth them. Default is 0.0.
+///
+/// Returns
+/// -------
+/// results : `NDArray`
+///     Diffused image as 2D numpy array of dtype float64 with same shape
+///     as input.
+///
+/// Raises
+/// ------
+/// `ValueError`
+///     If image dimensions are not positive.
+///     If image contains NaN or infinite values.
+///
+/// Notes
+/// -----
+/// The B-spline wavelet decomposition uses a 5-tap binomial filter
+/// approximating Gaussian convolution:
+///
+///     [1/16, 4/16, 6/16, 4/16, 1/16]
+///
+/// This provides multi-scale analysis where high-frequency components
+/// capture details and low-frequency components capture smooth variations.
+///
+/// The diffusion coefficient computation from structure tensor eigenvalues
+/// ensures edge preservation:
+///
+///     c = exp(-|∇u| * anisotropy)
+///
+/// See Also
+/// --------
+/// inpaint_mask : Inpaint masked regions using diffusion
 #[pyfunction]
 #[pyo3(signature = (image,
     iterations= 3,
@@ -714,6 +1020,23 @@ pub fn diffuse_gray_image<'py>(
     result.to_pyarray(py)
 }
 
+/// Replace masked pixels with Gaussian noise for inpainting initialization
+///
+/// Substitutes masked region pixels with values sampled from a Gaussian
+/// distribution centered at the original pixel value with standard
+/// deviation equal to the original value. This provides a stochastic
+/// starting point for subsequent diffusion-based inpainting.
+///
+/// # Arguments
+/// * `image` - Input image (contains original pixel values)
+/// * `mask` - Boolean mask indicating pixels to replace (True = replace)
+///
+/// # Returns
+/// * `Array2<T>` - Image with masked pixels replaced by noise
+///
+/// # Panics
+/// Panics if any masked pixel has value <= 0, as this would make
+/// the standard deviation non-positive for Normal::new().
 fn replace_masked_with_noise<T: NdFloat + Default>(
     image: ArrayView2<T>,
     mask: &ArrayView2<bool>,
@@ -738,6 +1061,85 @@ where
     result
 }
 
+/// Inpaint masked regions in a grayscale image using anisotropic diffusion.
+///
+/// First replaces masked regions with Gaussian noise (mean=original pixel
+/// value, std=original pixel value), then applies anisotropic diffusion
+/// while respecting mask boundaries. The diffusion process smooths the
+/// inpainted region while maintaining consistency with surrounding pixels.
+///
+/// Parameters
+/// ----------
+/// image : `NDArray`
+///     Input grayscale image as 2D numpy array of dtype float64.
+/// mask : `NDArray`
+///     Boolean mask where True indicates regions to inpaint. Must have
+///     same shape as image. Pixels with True are replaced with noise
+///     and then diffused.
+/// iterations : `int`, optional
+///     Number of diffusion iterations. Higher values produce more
+///     complete inpainting. Default is 32.
+/// anisotropy_first : `float`, optional
+///     Diffusion strength for gradient-based first directional derivative.
+///     Default is 0.0 (isotropic diffusion for inpainting).
+/// anisotropy_second : `float`, optional
+///     Diffusion strength for Laplacian-based second directional derivative.
+///     Default is 0.0.
+/// anisotropy_third : `float`, optional
+///     Diffusion strength for third directional derivative term.
+///     Default is 0.0.
+/// anisotropy_fourth : `float`, optional
+///     Diffusion strength for fourth directional derivative term.
+///     Default is 2.0 (edge-preserving).
+/// regularization : `float`, optional
+///     Regularization parameter for numerical stability. Default is 0.0.
+/// variance_threshold : `float`, optional
+///     Minimum variance threshold. Default is 0.0.
+/// radius_center : `float`, optional
+///     Center radius for diffusion weighting. Default is 0.0.
+/// first : `float`, optional
+///     First diffusion coefficient. Default is 0.0.
+/// second : `float`, optional
+///     Second diffusion coefficient. Default is 0.0.
+/// third : `float`, optional
+///     Third diffusion coefficient. Default is 0.0.
+/// fourth : `float`, optional
+///     Fourth diffusion coefficient. Default is 1.0.
+/// radius : `float`, optional
+///     Diffusion radius parameter. Default is 5.0.
+/// sharpness : `float`, optional
+///     Sharpness enhancement parameter. Default is 0.0.
+///
+/// Returns
+/// -------
+/// result : `NDArray`
+///     Inpainted image as 2D numpy array of dtype float64 with same shape
+///     as input.
+///
+/// Raises
+/// ------
+/// `ValueError`
+///     If image and mask dimensions do not match.
+///     If mask contains no True pixels (nothing to inpaint).
+///
+/// Notes
+/// -----
+/// Masked regions are filled with Gaussian noise where:
+/// - Mean = original pixel value
+/// - Standard deviation = original pixel value
+///
+/// This noise initialization provides a stochastic starting point that
+/// breaks symmetry and allows diffusion to fill the region with
+/// contextually appropriate values from the surroundings.
+///
+/// The diffusion process ensures:
+/// - Values at mask boundaries match the surrounding image
+/// - Interior values are smoothly interpolated
+/// - Edge preservation properties are maintained
+///
+/// See Also
+/// --------
+/// diffuse_gray_image : Apply anisotropic diffusion to entire image
 #[pyfunction]
 #[pyo3(signature = (image,
     mask,
@@ -801,4 +1203,63 @@ pub fn inpaint_mask<'py>(
     let mut masked = replace_masked_with_noise(array, &mask_array);
     let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
     result.to_pyarray(py)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::assert_delta;
+
+    #[test]
+    fn test_find_gradients_flat() {
+        let pixels = [0.0; 9];
+        let grad = find_gradients(pixels);
+        assert_delta!(grad[0], 0.0, 1e-10);
+        assert_delta!(grad[1], 0.0, 1e-10);
+    }
+
+    #[test]
+    fn test_find_gradients_slope_x() {
+        let pixels = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let grad = find_gradients(pixels);
+        // Gradient in x direction (columns 3,4,5)
+        assert_delta!(grad[1], 0.0, 1e-10);
+    }
+
+    #[test]
+    fn test_find_gradients_slope_y() {
+        let pixels = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let grad = find_gradients(pixels);
+        // Gradient in y direction (rows 0,1,2)
+        // pixels[7] - pixels[1] = 1.0 - 0.0 = 1.0
+        // grad[0] = 1.0 / 2.0 = 0.5
+        assert_delta!(grad[0], 0.5, 1e-10);
+    }
+
+    #[test]
+    fn test_isotrop_laplacian_sum() {
+        let lap: [f64; 9] = isotrop_laplacian();
+        let sum: f64 = lap.iter().map(|&x| x as f64).sum();
+        assert_delta!(sum, 0.0, 1e-10);
+    }
+
+    #[test]
+    fn test_isotrop_laplacian_center() {
+        let lap: [f64; 9] = isotrop_laplacian();
+        assert_delta!(lap[4], -3.0, 1e-10);
+    }
+
+    #[test]
+    fn test_compute_anisotropy_factor() {
+        assert_delta!(compute_anisotropy_factor(1.0), 1.0, 1e-10);
+        assert_delta!(compute_anisotropy_factor(0.0), 0.0, 1e-10);
+        assert_delta!(compute_anisotropy_factor(2.0), 4.0, 1e-10);
+    }
+
+    #[test]
+    fn test_check_isotropy_mode() {
+        assert_eq!(check_isotropy_mode(0.0), IsotropyType::Isotrope);
+        assert_eq!(check_isotropy_mode(1.0), IsotropyType::Isophote);
+        assert_eq!(check_isotropy_mode(-1.0), IsotropyType::Gradient);
+    }
 }
