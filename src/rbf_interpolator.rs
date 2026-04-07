@@ -28,66 +28,6 @@ are permitted provided that the following conditions are met:
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
 
-/*!
-# Radial Basis Function (RBF) Interpolation Module
-
-This module provides high-performance RBF interpolation for regular grids
-using a Rust backend with PyO3 bindings.
-
-## Mathematical Background
-
-The RBF interpolant is defined as:
-
-    s(x) = Σᵢ wᵢ ϕ(||x - cᵢ||) + Σⱼ pⱼ(x)
-
-where:
-- ϕ is the thin plate spline (TPS) kernel: ϕ(r) = r² ln(r²)
-- wᵢ are coefficients solved from the linear system
-- cᵢ are center coordinates (data points)
-- pⱼ(x) are polynomial terms ensuring uniqueness
-
-### Thin Plate Spline Kernel
-
-The TPS kernel ϕ(r) = r² ln(r²) is "branchless" because it operates on
-the squared distance r² instead of r. This avoids expensive sqrt operations.
-The mathematical equivalence:
-
-    ln(r) = ln(r²) / 2
-
-allows computing the kernel in a single step. A threshold (1e-100) prevents
-logarithm of zero for numerical stability.
-
-### Normalization
-
-Coordinates are normalized to improve numerical conditioning:
-
-    x_norm = (x - shift_x) / scale_x
-    y_norm = (y - shift_y) / scale_y
-
-This centers data around the origin and scales to unit variance.
-
-### Polynomial Terms
-
-The polynomial terms pⱼ(x) ensure the interpolant is unique. The powers
-matrix defines which monomials are included:
-- [[0, 0]] → constant term (1)
-- [[1, 0]] → linear x term
-- [[0, 1]] → linear y term
-- [[2, 0]] → quadratic x² term
-- etc.
-
-## Algorithm
-
-For each grid point (x, y):
-
-1. Compute RBF contribution: Σᵢ wᵢ ϕ(||x - cᵢ||²)
-2. Compute polynomial contribution: Σⱼ βⱼ x^exp_x y^exp_y
-3. Return sum: s(x, y) = RBF + polynomial
-
-The algorithm is O(n_centers × height × width) and optimized for regular
-grids by pre-computing powers and normalization.
-*/
-
 use ndarray::{Array2, ArrayView1, ArrayView2};
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::exceptions::PyValueError;
@@ -133,8 +73,7 @@ impl From<RbfError> for PyErr {
     }
 }
 
-// The branchless, inlineable kernel logic.
-// We use a constant to avoid magic numbers and a clamp to avoid NaNs.
+// We use a constant to clamp the radius to avoid NaNs at radius zero.
 const TPS_LOG_THRESHOLD: f64 = 1e-100;
 
 /// Evaluate the RBF interpolant on a regular grid.
@@ -143,7 +82,7 @@ const TPS_LOG_THRESHOLD: f64 = 1e-100;
 ///
 ///     s(x, y) = Σᵢ wᵢ ϕ(||x - cᵢ||²) + Σⱼ βⱼ x^exp_x y^exp_y
 ///
-/// where ϕ(r²) = r² ln(r²) is the thin plate spline kernel.
+/// where ϕ(r²) = r² ln(r) is the thin plate spline kernel.
 ///
 /// # Arguments
 /// * height: Grid height (output array rows)
@@ -163,11 +102,10 @@ const TPS_LOG_THRESHOLD: f64 = 1e-100;
 /// * RbfError::InvalidPowersShape: If powers.shape()[1] != 2
 ///
 /// # Notes
-/// * The TPS kernel uses branchless formulation: ϕ(r²) = r² ln(r²)
 /// * Normalization improves numerical stability: x_norm = (x - shift) / scale
 /// * Polynomial powers are pre-computed for each grid row/column
 /// * Algorithm complexity: O(n_centers × height × width)
-fn compute_rbf_grid_dynamic(
+fn compute_rbf_grid(
     height: usize,
     width: usize,
     centers: ArrayView1<f64>,
@@ -257,7 +195,7 @@ fn compute_rbf_grid_dynamic(
             }
 
             // 1. RBF Contribution: Σᵢ wᵢ ϕ(||x - cᵢ||²)
-            // The TPS kernel ϕ(r²) = r² ln(r²) is "branchless" - no sqrt needed
+            // The TPS kernel ϕ(r²) = r² ln(r)
             // Mathematical equivalence: ln(r) = ln(r²) / 2
             // Division by 2 is part of the TPS formulation
             let mut rbf_sum = 0.0;
@@ -266,8 +204,8 @@ fn compute_rbf_grid_dynamic(
                 let dx = x_coord as f64 - c_x;
                 let r_sq = dx * dx + y_r_comp_nn[i];
 
-                // Branchless TPS: use r² directly to avoid sqrt
-                // Clamp to avoid ln(0) for numerical stability
+                // Clamp to avoid ln(0) for numerical stability and avoid
+                // branching if statements.
                 let clamped_r_sq = r_sq.max(TPS_LOG_THRESHOLD);
                 let kernel_val = clamped_r_sq * clamped_r_sq.ln();
 
@@ -334,7 +272,7 @@ fn compute_rbf_grid_dynamic(
 ///
 /// Notes
 /// -----
-/// This function calls the Rust backend `compute_rbf_grid_dynamic` which
+/// This function calls the Rust backend `compute_rbf_grid` which
 /// computes the RBF interpolant:
 ///
 ///     s(x, y) = Σᵢ wᵢ ϕ(||x - cᵢ||²) + Σⱼ βⱼ x^exp_x y^exp_y
@@ -361,7 +299,7 @@ fn fast_rbf_grid_ndarray<'py>(
     let powers_view = powers.as_array();
 
     // Perform the computation and propagate errors
-    let result = compute_rbf_grid_dynamic(
+    let result = compute_rbf_grid(
         height,
         width,
         centers_view,
@@ -396,7 +334,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             5,
             5,
             centers.view(),
@@ -421,7 +359,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             5,
             5,
             centers.view(),
@@ -447,7 +385,7 @@ mod tests {
         let scale = arr1(&[2.0, 2.0]);
         let powers = arr2(&[[0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             4,
             4,
             centers.view(),
@@ -471,7 +409,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64], [1i64, 0i64], [0i64, 1i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             2,
             2,
             centers.view(),
@@ -498,7 +436,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             2,
             2,
             centers.view(),
@@ -525,7 +463,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             2,
             2,
             centers.view(),
@@ -548,7 +486,7 @@ mod tests {
         let scale = arr1(&[1.0, 1.0]);
         let powers = arr2(&[[0i64, 0i64]]);
 
-        let result = compute_rbf_grid_dynamic(
+        let result = compute_rbf_grid(
             2,
             2,
             centers.view(),

@@ -41,6 +41,12 @@ const B_SPLINE_SIGMA: f64 = 2.0553651328015339;
 const H: usize = 1;
 const KAPPA: f64 = 0.25;
 
+/// Matrix representing rotations
+struct RotationMatrix<T: NdFloat + Default>([[T; 2]; 2]);
+
+/// Flattened 3x3 matrix
+struct Flat3Matrix<T: NdFloat + Default>([T; 9]);
+
 /// Types of anisotropic diffusion behavior
 ///
 /// Determines how diffusion responds to image gradients and edges.
@@ -56,7 +62,8 @@ enum IsotropyType {
 }
 
 #[inline]
-fn find_gradients<T: NdFloat + Default>(pixels: [T; 9]) -> [T; 2] {
+fn find_gradients<T: NdFloat + Default>(pixels: Flat3Matrix<T>) -> [T; 2] {
+    let pixels = pixels.0;
     [
         (pixels[7] - pixels[1]) / T::from(2.0).unwrap(),
         (pixels[5] - pixels[3]) / T::from(2.0).unwrap(),
@@ -70,10 +77,10 @@ fn find_gradients<T: NdFloat + Default>(pixels: [T; 9]) -> [T; 2] {
 /// is negative to implement the Laplacian operator: Σ(neighbor - center)
 ///
 /// # Returns
-/// * `[T; 9]` - Kernel coefficients in row-major order
+/// * `Flat3Matrix` - Kernel coefficients in row-major order
 #[inline]
-fn isotrop_laplacian<T: NdFloat + Default>() -> [T; 9] {
-    [
+fn isotrop_laplacian<T: NdFloat + Default>() -> Flat3Matrix<T> {
+    Flat3Matrix([
         T::from(0.25).unwrap(),
         T::from(0.5).unwrap(),
         T::from(0.25).unwrap(),
@@ -83,7 +90,7 @@ fn isotrop_laplacian<T: NdFloat + Default>() -> [T; 9] {
         T::from(0.25).unwrap(),
         T::from(0.5).unwrap(),
         T::from(0.25).unwrap(),
-    ]
+    ])
 }
 
 /// Compute rotation matrix for isophote-based anisotropic diffusion
@@ -106,13 +113,13 @@ fn rotation_matrix_isophote<T: NdFloat + Default>(
     cos_theta_sin_theta: T,
     cos_theta2: T,
     sin_theta2: T,
-) -> [[T; 2]; 2] {
+) -> RotationMatrix<T> {
     let mut a: [[T; 2]; 2] = [[T::default(); 2]; 2];
     a[0][0] = cos_theta2 + c2 * sin_theta2;
     a[1][1] = c2 * cos_theta2 + sin_theta2;
     a[0][1] = (c2 - T::from(1.0).unwrap()) * cos_theta_sin_theta;
     a[1][0] = a[0][1];
-    a
+    RotationMatrix(a)
 }
 
 /// Compute rotation matrix for gradient-based anisotropic diffusion
@@ -135,13 +142,13 @@ fn rotation_matrix_gradient<T: NdFloat + Default>(
     cos_theta_sin_theta: T,
     cos_theta2: T,
     sin_theta2: T,
-) -> [[T; 2]; 2] {
+) -> RotationMatrix<T> {
     let mut a: [[T; 2]; 2] = [[T::default(); 2]; 2];
     a[0][0] = c2 * cos_theta2 + sin_theta2;
     a[1][1] = cos_theta2 + c2 * sin_theta2;
     a[0][1] = (T::from(1.0).unwrap() - c2) * cos_theta_sin_theta;
     a[1][0] = a[0][1];
-    a
+    RotationMatrix(a)
 }
 
 /// Build 3×3 diffusion kernel from 2×2 rotation matrix
@@ -155,14 +162,15 @@ fn rotation_matrix_gradient<T: NdFloat + Default>(
 /// * `a` - 2×2 rotation matrix encoding gradient information
 ///
 /// # Returns
-/// * `[T; 9]` - 3×3 kernel coefficients in row-major order
+/// * `Flat3Matrix<T>` - 3×3 kernel coefficients in row-major order
 #[inline]
-fn build_matrix<T: NdFloat + Default>(a: [[T; 2]; 2]) -> [T; 9] {
+fn build_matrix<T: NdFloat + Default>(a: RotationMatrix<T>) -> Flat3Matrix<T> {
+    let a = a.0;
     let b11 = a[0][1] / T::from(2.0).unwrap();
     let b13 = -b11;
     let b22 = T::from(-2.0).unwrap() * (a[0][0] + a[1][1]);
 
-    [b11, a[1][1], b13, a[0][0], b22, a[0][0], b13, a[1][1], b11]
+    Flat3Matrix([b11, a[1][1], b13, a[0][0], b22, a[0][0], b13, a[1][1], b11])
 }
 
 /// Compute 3×3 diffusion kernel based on isotropy type
@@ -179,7 +187,7 @@ fn build_matrix<T: NdFloat + Default>(a: [[T; 2]; 2]) -> [T; 9] {
 /// * `isotropy_type` - Type of anisotropic behavior to apply
 ///
 /// # Returns
-/// * `[T; 9]` - 3×3 kernel coefficients in row-major order
+/// * `Flat3Matrix<T>` - 3×3 kernel coefficients in row-major order
 #[inline]
 fn compute_kernel<T: NdFloat + Default>(
     c2: T,
@@ -187,7 +195,7 @@ fn compute_kernel<T: NdFloat + Default>(
     cos_theta2: T,
     sin_theta2: T,
     isotropy_type: &IsotropyType,
-) -> [T; 9] {
+) -> Flat3Matrix<T> {
     match isotropy_type {
         IsotropyType::Isotrope => isotrop_laplacian(),
         IsotropyType::Isophote => {
@@ -286,8 +294,8 @@ fn heat_pde_diffusion<T: NdFloat + Default>(
                     }
                 }
 
-                let mut gradient = find_gradients(neighbour_pixel_lf);
-                let mut laplace = find_gradients(neighbour_pixel_hf);
+                let mut gradient = find_gradients(Flat3Matrix(neighbour_pixel_lf));
+                let mut laplace = find_gradients(Flat3Matrix(neighbour_pixel_hf));
 
                 let magnitude_grad = (gradient[0].powi(2) + gradient[1].powi(2)).sqrt();
                 c2[0] = -magnitude_grad * anisotropy[0];
@@ -355,10 +363,10 @@ fn heat_pde_diffusion<T: NdFloat + Default>(
                 let mut derivatives: [T; 4] = [T::default(); 4];
                 let mut variance = T::default();
                 for k in 0..9 {
-                    derivatives[0] += kern_first[k] * neighbour_pixel_lf[k];
-                    derivatives[1] += kern_second[k] * neighbour_pixel_lf[k];
-                    derivatives[2] += kern_third[k] * neighbour_pixel_hf[k];
-                    derivatives[3] += kern_fourth[k] * neighbour_pixel_hf[k];
+                    derivatives[0] += kern_first.0[k] * neighbour_pixel_lf[k];
+                    derivatives[1] += kern_second.0[k] * neighbour_pixel_lf[k];
+                    derivatives[2] += kern_third.0[k] * neighbour_pixel_hf[k];
+                    derivatives[3] += kern_fourth.0[k] * neighbour_pixel_hf[k];
                     variance += neighbour_pixel_hf[k].powi(2);
                 }
 
@@ -393,9 +401,6 @@ fn check_isotropy_mode<T: NdFloat + Default>(anisotropy: T) -> IsotropyType {
         IsotropyType::Gradient
     }
 }
-
-// #[inline]
-// fn sparse_scalar_product()
 
 /// Perform vertical B-spline convolution pass on image
 ///
@@ -671,8 +676,6 @@ fn wavelets_process<T: NdFloat + Default>(
         );
 
         final_scale = sc;
-
-        // needed for second borrow
     }
 
     if final_scale == 0 {
@@ -1212,7 +1215,7 @@ mod tests {
 
     #[test]
     fn test_find_gradients_flat() {
-        let pixels = [0.0; 9];
+        let pixels = Flat3Matrix([0.0; 9]);
         let grad = find_gradients(pixels);
         assert_delta!(grad[0], 0.0, 1e-10);
         assert_delta!(grad[1], 0.0, 1e-10);
@@ -1220,7 +1223,7 @@ mod tests {
 
     #[test]
     fn test_find_gradients_slope_x() {
-        let pixels = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let pixels = Flat3Matrix([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
         let grad = find_gradients(pixels);
         // Gradient in x direction (columns 3,4,5)
         assert_delta!(grad[1], 0.0, 1e-10);
@@ -1228,7 +1231,7 @@ mod tests {
 
     #[test]
     fn test_find_gradients_slope_y() {
-        let pixels = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let pixels = Flat3Matrix([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
         let grad = find_gradients(pixels);
         // Gradient in y direction (rows 0,1,2)
         // pixels[7] - pixels[1] = 1.0 - 0.0 = 1.0
@@ -1238,15 +1241,15 @@ mod tests {
 
     #[test]
     fn test_isotrop_laplacian_sum() {
-        let lap: [f64; 9] = isotrop_laplacian();
-        let sum: f64 = lap.iter().map(|&x| x as f64).sum();
+        let lap = isotrop_laplacian::<f64>();
+        let sum: f64 = lap.0.iter().map(|&x| x as f64).sum();
         assert_delta!(sum, 0.0, 1e-10);
     }
 
     #[test]
     fn test_isotrop_laplacian_center() {
-        let lap: [f64; 9] = isotrop_laplacian();
-        assert_delta!(lap[4], -3.0, 1e-10);
+        let lap = isotrop_laplacian::<f64>();
+        assert_delta!(lap.0[4], -3.0, 1e-10);
     }
 
     #[test]

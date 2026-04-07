@@ -32,7 +32,9 @@ are permitted provided that the following conditions are met:
 Color space conversion functions for RGB images are defined in this module.
 */
 
-// many of the names in this file follow established capitalization practices.
+// many of the names in this file do follow established capitalization
+// practices for rust, but follow established norms in various image
+// processing papers.
 // Compile warnings should be suppressed for this module.
 #![allow(non_snake_case)]
 

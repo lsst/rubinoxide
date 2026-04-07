@@ -28,44 +28,80 @@
 #  POSSIBILITY OF SUCH DAMAGE.
 
 """
-Radial Basis Function (RBF) Interpolation Module
+# Radial Basis Function (RBF) Interpolation Module
 
-This module provides optimized RBF interpolation using a Rust backend.
-RBF interpolation constructs a smooth interpolant from scattered data points.
+This module provides high-performance RBF interpolation for regular grids
+using a Rust backend with PyO3 bindings.
 
-Mathematical Background
------------------------
-The RBF interpolant takes the form:
+## Mathematical Background
 
-    s(x) = Σᵢ wᵢ ϕ(||x - cᵢ||) + Σⱼ pⱼ(x)
+The RBF interpolant is defined as:
+
+    ``s(x) = Σᵢ wᵢ ϕ(||x - cᵢ||) + Σⱼ pⱼ(x)``
 
 where:
-- ϕ is the thin plate spline (TPS) kernel: ϕ(r) = r² ln(r²)
+- ϕ is the thin plate spline (TPS) kernel: ϕ(r) = r² ln(r)
 - wᵢ are coefficients solved from the linear system
 - cᵢ are center coordinates (data points)
 - pⱼ(x) are polynomial terms ensuring uniqueness
 
-The thin plate spline kernel is "branchless" because it operates on r²
-instead of r, avoiding expensive sqrt operations. The mathematical equivalence:
+The polynomial ensures uniqueness as described in the scipy documenation on
+radial basis functions:
+`Radial Basis Functions <https://docs.scipy.org/doc/scipy/reference/generated/
+scipy.interpolate.RBFInterpolator.html`>__.
 
-    ln(r) = ln(r²) / 2
+### Thin Plate Spline Kernel
+
+The TPS kernel ϕ(r) = r² ln(r) would require the use of a sqrt opertation at
+every point which can get expensive. Instead the mathematical equivalence:
+
+    ``ln(r) = ln(r²) / 2```
 
 allows computing the kernel in a single step. A threshold (1e-100) prevents
 logarithm of zero for numerical stability.
 
-For regular grid evaluation, the Rust backend pre-computes polynomial powers
-and normalizes coordinates for numerical stability.
+### Normalization
+
+Coordinates are normalized to improve numerical conditioning:
+
+    ``x_norm = (x - shift_x) / scale_x``
+    ``y_norm = (y - shift_y) / scale_y``
+
+This centers data around the origin and scales to unit variance.
+
+### Polynomial Terms
+
+The polynomial terms pⱼ(x) ensure the interpolant is unique. The powers
+matrix defines which monomials are included:
+- [[0, 0]] → constant term (1)
+- [[1, 0]] → linear x term
+- [[0, 1]] → linear y term
+- [[2, 0]] → quadratic x² term
+- etc.
+
+## Algorithm
+
+For each grid point (x, y):
+
+1. Compute RBF contribution: Σᵢ wᵢ ϕ(||x - cᵢ||²)
+2. Compute polynomial contribution: Σⱼ βⱼ x^exp_x y^exp_y
+3. Return sum: s(x, y) = RBF + polynomial
+
+The algorithm is O(n_centers × height × width) and optimized for regular
+grids by pre-computing powers and normalization.
 """
 
 import logging
 import time
+from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from ._rubinoxide import _rbf_interpolator
 
 
-def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple):
+def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple[int, int]) -> NDArray[np.floating[Any]]:
     """Evaluate a fitted RBFInterpolator on a regular grid using a
     high-performance Rust backend via PyO3.
 
@@ -83,7 +119,7 @@ def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple):
 
     Returns
     -------
-    return : `np.ndarray`
+    return : `numpy.ndarray`
         A 2D array of shape ``grid_shape`` containing the interpolated values.
 
     Raises
@@ -96,7 +132,7 @@ def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple):
     -----
     The Rust backend computes the RBF interpolant:
 
-        s(x) = Σᵢ wᵢ ϕ(||x - cᵢ||) + Σⱼ pⱼ(x)
+        ``s(x) = Σᵢ wᵢ ϕ(||x - cᵢ||) + Σⱼ pⱼ(x)``
 
     where ϕ is the thin plate spline kernel.
 
@@ -125,6 +161,10 @@ def fast_rbf_interpolation_on_grid(rbf_interp, grid_shape: tuple):
     # Solved coefficients from the linear system
     # Shape: (n_centers + n_poly_terms, 1) - contains both RBF weights and
     # polynomial coeffs
+    # Because we are using scipy's implementation of the solver we need
+    # to reach in to get the coefficents. In the future we will look into
+    # either upstreaming public acess, upstreaming this evaluator, or
+    # implementing our own fitter.
     coeffs_flat = rbf_interp._coeffs.ravel()
 
     n_centers = centers.shape[0]
