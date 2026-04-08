@@ -33,6 +33,8 @@ use ndarray::{Array2, ArrayView2, ArrayViewMut2, NdFloat};
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal, StandardNormal};
 use std::cmp;
 
@@ -1043,6 +1045,7 @@ pub fn diffuse_gray_image<'py>(
 fn replace_masked_with_noise<T: NdFloat + Default>(
     image: ArrayView2<T>,
     mask: &ArrayView2<bool>,
+    random_seed: Option<u64>,
 ) -> Array2<T>
 where
     StandardNormal: Distribution<T>,
@@ -1055,7 +1058,11 @@ where
             result[(i, j)] = if mask[(i, j)] {
                 let normal = Normal::new(val, val).unwrap();
 
-                normal.sample(&mut rand::rng())
+                let mut rng = match random_seed {
+                    Some(seed) => StdRng::seed_from_u64(seed),
+                    None => StdRng::from_rng(&mut rand::rng()),
+                };
+                normal.sample(&mut rng)
             } else {
                 image[(i, j)]
             }
@@ -1112,6 +1119,9 @@ where
 ///     Diffusion radius parameter. Default is 5.0.
 /// sharpness : `float`, optional
 ///     Sharpness enhancement parameter. Default is 0.0.
+/// random_seed : `int`, optional
+///     An optional positive int that is used to set the random seed. If
+///     None, no seed will be set.
 ///
 /// Returns
 /// -------
@@ -1160,6 +1170,7 @@ where
     fourth= 1.0,
     radius= 5.0,
     sharpness= 0.0,
+    random_seed = None
 ))]
 pub fn inpaint_mask<'py>(
     py: Python<'py>,
@@ -1179,6 +1190,7 @@ pub fn inpaint_mask<'py>(
     fourth: f64,
     radius: f64,
     sharpness: f64,
+    random_seed: Option<u64>,
 ) -> Bound<'py, PyArray2<f64>> {
     let array = image.as_array();
     let mask_array = mask.as_array();
@@ -1203,7 +1215,7 @@ pub fn inpaint_mask<'py>(
         radius,
         sharpness,
     };
-    let mut masked = replace_masked_with_noise(array, &mask_array);
+    let mut masked = replace_masked_with_noise(array, &mask_array, random_seed);
     let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
     result.to_pyarray(py)
 }

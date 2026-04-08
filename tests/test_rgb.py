@@ -81,7 +81,7 @@ class DiffusionTestCase(TestCase):
         np.random.seed(42)
         test_image = np.random.rand(30, 30).astype(np.float64)
         mask = np.zeros((30, 30), dtype=bool)
-        result = rgb.inpaint_mask(test_image, mask, iterations=10)
+        result = rgb.inpaint_mask(test_image, mask, iterations=10, random_seed=20)
         np.testing.assert_allclose(result, test_image, atol=1e-10)
 
     def test_diffuse_linear_gradient_preserved(self):
@@ -135,7 +135,7 @@ class DiffusionTestCase(TestCase):
         mask = np.zeros((50, 50), dtype=bool)
         mask[15:35, 15:35] = True
 
-        result = rgb.inpaint_mask(test_image, mask, iterations=20)
+        result = rgb.inpaint_mask(test_image, mask, iterations=20, random_seed=20)
 
         masked_values = result[18:32, 18:32]
         self.assertGreater(masked_values.min(), 0.16)
@@ -149,7 +149,7 @@ class DiffusionTestCase(TestCase):
         mask = np.zeros((50, 50), dtype=bool)
         mask[:, 20:30] = True
 
-        result = rgb.inpaint_mask(test_image, mask, iterations=20)
+        result = rgb.inpaint_mask(test_image, mask, iterations=20, random_seed=20)
 
         left_mean = result[20, 20].mean()
         np.testing.assert_allclose(left_mean, 0.5, atol=0.1)
@@ -166,7 +166,7 @@ class DiffusionTestCase(TestCase):
             np.random.seed(seed)
             mask = np.zeros((50, 50), dtype=bool)
             mask[25, 25] = True
-            result = rgb.inpaint_mask(test_image, mask, iterations=5)
+            result = rgb.inpaint_mask(test_image, mask, iterations=5, random_seed=seed)
             results.append(result[25, 25])
 
         self.assertGreater(np.std(results), 0.01)
@@ -176,7 +176,7 @@ class DiffusionTestCase(TestCase):
         test_image = np.ones((20, 20), dtype=np.float64) * 0.5
         mask = np.ones((20, 20), dtype=bool)
 
-        result = rgb.inpaint_mask(test_image, mask, iterations=10)
+        result = rgb.inpaint_mask(test_image, mask, iterations=10, random_seed=20)
         self.assertEqual(result.shape, test_image.shape)
         self.assertTrue(np.isfinite(result).all())
 
