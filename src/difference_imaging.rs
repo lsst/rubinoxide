@@ -26,21 +26,22 @@ are permitted provided that the following conditions are met:
  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-use pyo3::prelude::*;
+*/
+mod diff_kernel;
+extern crate openblas_src;
 
-mod difference_imaging;
-mod rbf_interpolator;
-mod rgb;
-mod test_utils;
+use diff_kernel::{generate_gauss_hermite_basis, my_convolve, DiffKernel};
+use pyo3::exceptions::PyValueError;
+use pyo3::types::IntoPyDict;
+use pyo3::{prelude::*, BoundObject};
 
-/// A Python module to convert to/from oklab/rgb with specific colorspaces.
-#[pymodule]
-fn _rubinoxide<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
-    // initialize the logger such that rust logs get sent to python
-    pyo3_log::init();
-    rbf_interpolator::create_rbf_module(&m)?;
-    rgb::create_rgb_module(&m)?;
-    difference_imaging::create_diff_kernel_module(&m)?;
-    Ok(())
+pub fn create_diff_kernel_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let diff_module = PyModule::new(parent_module.py(), "difference_kernel")?;
+    diff_module.add_class::<DiffKernel>()?;
+    diff_module.add_function(wrap_pyfunction!(my_convolve, &diff_module)?)?;
+    diff_module.add_function(wrap_pyfunction!(
+        generate_gauss_hermite_basis,
+        &diff_module
+    )?)?;
+    parent_module.add_submodule(&diff_module)
 }
