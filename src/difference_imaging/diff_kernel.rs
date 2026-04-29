@@ -37,6 +37,7 @@ use ndarray::{prelude::*, Zip};
 use ndarray::{Array1, Array2};
 use ndarray_conv::{ConvFFTExt, ConvMode, FftProcessor, PaddingMode};
 use ndarray_linalg::Inverse;
+use ndarray_linalg::Solve;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::IntoPyDict;
@@ -47,6 +48,7 @@ struct ConvolveCache {
     pixel_size: usize,
     basis_size: usize,
     current_index: usize,
+    y_hop_cache: Array1<f64>,
 }
 
 impl ConvolveCache {
@@ -56,6 +58,7 @@ impl ConvolveCache {
             pixel_size,
             basis_size,
             current_index: 0,
+            y_hop_cache: Array1::<f64>::zeros(pixel_size),
         }
     }
 
@@ -71,7 +74,59 @@ impl ConvolveCache {
     }
 }
 
-#[inline]
+/// Convolve the separable basis kernel with a region of the input image at one output pixel.
+///
+/// For each basis function, the kernel is separable: `K(i, j) = basis_y[i] * basis_x[j]`.
+/// This makes the 2D convolution `output[y, x] = Σ_i Σ_j input[y+i, x+j] * basis_y[i] * basis_x[j]`
+/// decomposable into two 1D steps:
+///
+/// 1. **Y-direction** — for each column `c` in the kernel window, compute
+///    `col_conv[c] = Σ_i input[y+i, c] * basis_y[i]`
+/// 2. **X-direction** — combine the column convolutions with the x-kernel:
+///    `basis_values[bas] = Σ_j basis_x[j] * col_conv[j]`
+///
+/// This function handles both cache-miss and cache-hit cases for a sliding-window
+/// traversal across the image.
+///
+/// ## Cache miss — full recomputation (new row or non-sequential jump)
+///
+/// Triggered when the previous pixel was on a different row or was not adjacent
+/// (`y != prev_y` or `abs(x - prev_x) != 1`). The entire 2D convolution for all
+/// kernel window columns is recomputed from scratch.
+///
+/// The algorithm uses a **row-major inner loop** to maximize memory locality: for each
+/// row `y_start + y_v`, it reads `kernel_size` contiguous input pixels (one for each
+/// kernel column) and multiplies them by `basis_y[y_v]`. This means each input row is
+/// touched exactly once, rather than the naive column-by-column approach that would
+/// read the same row multiple times (once per column). After all rows are accumulated
+/// into the ring buffer (`basis_y_cache`), the x-kernel dot product is applied.
+///
+/// ## Cache hit — sliding window update (consecutive pixel to the right)
+///
+/// Triggered when moving to the immediately adjacent pixel on the same row. One new
+/// column convolution (the rightmost edge entering the kernel window) is computed,
+/// then one existing ring buffer slot is overwritten with it. The output is assembled
+/// by reading ring slots in the correct order: slots `(cache_offset+1) mod N` through
+/// `(N-1)` give the contiguous block, while slots `0` through `cache_offset` give the
+/// wrapped-around block. This produces `basis_x[0]*CC[1] + ... + basis_x[(N-1)]*CC[new]`.
+///
+/// ## Ring buffer design
+///
+/// The `ConvolveCache` ring has `pixel_size = 2*radius + 1` slots, exactly matching
+/// the kernel width. After a cache miss fills all slots sequentially, `current_index`
+/// is initialized to 0. On each cache hit:
+///
+/// 1. The new column convolution is written to `ring[current_index]`, overwriting the
+///    oldest value in the ring.
+/// 2. The output is assembled by reading from `(current_index+1) % N` to the end of
+///    the ring, then wrapping around from 0 to `current_index`. This correctly maps
+///    the ring positions to kernel window columns because the overwrite happens at the
+///    slot whose value has already been absorbed into the cumulative output.
+/// 3. `current_index` is incremented modulo `N` for the next hit.
+///
+/// After the function returns, regardless of which path was taken, `prev_x` and `prev_y`
+/// are updated so the next call can determine whether it is a cache hit or miss.
+#[inline(never)]
 fn convolve_at_one_point(
     x: &i32,
     y: &i32,
@@ -104,18 +159,34 @@ fn convolve_at_one_point(
                 let basis_x_ptr = basis_arrays[bas].1.as_ptr();
                 // intermediate container for x kernel multiplied by template summed for each x
                 let basis_y_cache_ptr = basis_y_cache.array.get_mut_ptr((bas, 0)).unwrap();
-                for (x_v, x_ind) in (x_start..x_stop).into_iter().enumerate() {
+                for y_v in 0..2 * kernel_radius + 1 {
                     let input_ptr = input_array
-                        .get_ptr((y_start as usize, x_ind as usize))
+                        .get_ptr(((y_start + y_v) as usize, x_start as usize))
                         .unwrap();
-                    for y_v in 0..2 * kernel_radius + 1 {
+                    let basis_y_val = *basis_y_ptr.add(y_v as usize);
+                    for x_v in 0..2 * kernel_radius + 1 {
                         *basis_y_cache_ptr.add(x_v as usize) +=
-                            *input_ptr.add(y_v as usize * input_array.dim().1) as f64
-                                * *basis_y_ptr.add(y_v as usize);
+                            *input_ptr.add(x_v as usize) as f64 * basis_y_val;
                     }
+                }
+
+                for x_v in 0..2 * kernel_radius + 1 {
                     *basis_values_ptr.add(bas) +=
                         *basis_x_ptr.add(x_v as usize) * *basis_y_cache_ptr.add(x_v as usize);
                 }
+
+                // for (x_v, x_ind) in (x_start..x_stop).into_iter().enumerate() {
+                //     let input_ptr = input_array
+                //         .get_ptr((y_start as usize, x_ind as usize))
+                //         .unwrap();
+                //     for y_v in 0..2 * kernel_radius + 1 {
+                //         *basis_y_cache_ptr.add(x_v as usize) +=
+                //             *input_ptr.add(y_v as usize * input_array.dim().1) as f64
+                //                 * *basis_y_ptr.add(y_v as usize);
+                //     }
+                //     *basis_values_ptr.add(bas) +=
+                //         *basis_x_ptr.add(x_v as usize) * *basis_y_cache_ptr.add(x_v as usize);
+                // }
             }
         }
     } else {
@@ -127,11 +198,23 @@ fn convolve_at_one_point(
             let existing_column_offset = (cache_offset + 1) % basis_y_cache.pixel_size;
 
             let row_offset = input_array.dim().1;
+
+            // grab the cache unfriendly code once up front instead of each loop
+            let hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
+            let mut input_ptr = input_array
+                .get_ptr((y_start as usize, (x_stop - 1) as usize))
+                .unwrap();
+            for hop in 0..x_len {
+                *hop_cache.add(hop) = *input_ptr;
+                input_ptr = input_ptr.add(row_offset);
+            }
+
             for bas in 0..basis_len {
                 // calculate the last y colum
-                let mut input_ptr = input_array
-                    .get_ptr((y_start as usize, (x_stop - 1) as usize))
-                    .unwrap();
+                // let mut input_ptr = input_array
+                //     .get_ptr((y_start as usize, (x_stop - 1) as usize))
+                //     .unwrap();
+                let mut hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
                 let mut basis_y_ptr = basis_arrays[bas].0.as_ptr();
                 let basis_x_ptr = basis_arrays[bas].1.as_ptr();
                 let basis_y_cache_ptr = basis_y_cache.array.get_mut_ptr((bas, 0)).unwrap();
@@ -141,10 +224,12 @@ fn convolve_at_one_point(
                 *tmp_ptr = 0.0;
                 let mut acc = 0.0;
                 for _ in 0..x_len {
-                    acc += *basis_y_ptr * *input_ptr;
+                    // acc += *basis_y_ptr * *input_ptr;
+                    acc += *basis_y_ptr * *hop_cache;
                     // *tmp_ptr += *basis_y_ptr.add(y_v) * *input_ptr;
                     basis_y_ptr = basis_y_ptr.add(1);
-                    input_ptr = input_ptr.add(row_offset);
+                    hop_cache = hop_cache.add(1)
+                    // input_ptr = input_ptr.add(row_offset);
                 }
                 *tmp_ptr = acc;
 
@@ -357,7 +442,6 @@ impl DiffKernel {
                     &input_f64,
                 );
 
-                let mut forward_iterator = 0;
                 let mut accu: f64 = 0.0;
 
                 unsafe {
@@ -601,122 +685,18 @@ impl DiffKernel {
 
         let mut spatial_terms_filtered = Array1::<f64>::zeros(size);
         let x_len = basis_arrays[0].0.dim();
-        // let x_len = basis_arrays.dim().1;
         let mut basis_values = Array1::<f64>::zeros(basis_len);
-        // let mut basis_y_arrays = Array2::<f64>::zeros((basis_len, x_len));
         let mut basis_y_cache = ConvolveCache::new(x_len, basis_len);
 
         println!("looping positions");
         let mut prev_y = i32::MAX;
         let mut prev_x = i32::MAX;
 
-        // let mut new_basis_arrays = Array3::<f64>::zeros((basis_dims, x_len, x_len));
-        // for bas in 0..basis_len {
-        //     let y_col = basis_arrays[bas].0.to_shape((x_len, 1)).unwrap();
-        //     let x_row = basis_arrays[bas].1.to_shape((1, x_len)).unwrap();
-        //     new_basis_arrays
-        //         .slice_mut(s![bas, .., ..])
-        //         .assign(&y_col.dot(&x_row));
-        // }
-        // let new_basis_arrays = basis_arrays;
-        // let element_size = std::mem::size_of::<f64>();
-        // let num_elements = size * basis_len;
-        // let layout = Layout::from_size_align(element_size * num_elements, 16).unwrap();
-        // let manual_terms_ptr = unsafe { alloc(layout) as *mut f64 };
-
-        // let mut stack_array: [f64; 250] = [0.0; 250];
-
-        // let mut terms = unsafe {
-        //     ArrayViewMut1::<f64>::from_shape_ptr(
-        //         (num_elements).strides(1),
-        //         stack_array.as_mut_ptr(),
-        //     )
-        // };
         let mut terms = Array1::<f32>::zeros(num_parameters);
 
         let template_f64 = template_array.mapv(|v| v as f64);
 
         for (x, y) in &xy_positions {
-            /*
-            let y_start = *y - kernel_width;
-            // let y_stop = *y + kernel_width + 1;
-
-            let x_start = **x - kernel_width;
-            let x_stop = **x + kernel_width + 1;
-
-            // let template_view = template_array
-            //     .slice(s![y_start..y_stop, x_start..x_stop])
-            //     .mapv(|v| v as f64);
-
-            // let basis_values = (&new_basis_arrays * &template_view)
-            //     .axis_iter(Axis(0))
-            //     .map(|x| x.sum())
-            //     .collect::<Array1<f64>>();
-
-            // need to zero of the basis_value to start as it will be set from previous loop
-            basis_values.fill(0.0);
-
-            if (**y != prev_y) || (**x - prev_x) != 1 {
-                // Since this is a new pixel jump, need to reset this cache var
-                basis_y_arrays.fill(0.0);
-                unsafe {
-                    //basis_values are the result of the convolution with each basis function
-                    let basis_values_ptr = basis_values.as_mut_ptr();
-                    // loop over each basis function number
-                    for bas in 0..basis_len {
-                        let basis_y_ptr = basis_arrays[bas].0.as_ptr();
-                        let basis_x_ptr = basis_arrays[bas].1.as_ptr();
-                        // intermediate container for x kernel multiplied by template summed for each x
-                        let basis_y_array_ptr = basis_y_arrays.get_mut_ptr((bas, 0)).unwrap();
-                        for (x_v, x_ind) in (x_start..x_stop).into_iter().enumerate() {
-                            let template_ptr = template_array
-                                .get_ptr((y_start as usize, x_ind as usize))
-                                .unwrap();
-                            for y_v in 0..2 * kernel_width + 1 {
-                                *basis_y_array_ptr.add(x_v as usize) +=
-                                    *template_ptr.add(y_v as usize * template_array.dim().1) as f64
-                                        * *basis_y_ptr.add(y_v as usize);
-                            }
-                            *basis_values_ptr.add(bas) += *basis_x_ptr.add(x_v as usize)
-                                * *basis_y_array_ptr.add(x_v as usize);
-                        }
-                    }
-                }
-            } else {
-                unsafe {
-                    let basis_values_ptr = basis_values.as_mut_ptr();
-
-                    for bas in 0..basis_len {
-                        let basis_y_ptr = basis_arrays[bas].0.as_ptr();
-                        let basis_x_ptr = basis_arrays[bas].1.as_ptr();
-                        let basis_y_array_ptr = basis_y_arrays.get_mut_ptr((bas, 0)).unwrap();
-
-                        // need to shift down all the y values by 1
-                        for i in 0..x_len - 1 {
-                            *basis_y_array_ptr.add(i) = *basis_y_array_ptr.add(i + 1);
-                        }
-
-                        // calculate the last y colum
-                        let template_ptr = template_array
-                            .get_ptr((y_start as usize, (x_stop - 1) as usize))
-                            .unwrap();
-                        // set the last value to zero
-                        *basis_y_array_ptr.add(x_len - 1) = 0.0;
-                        for y_v in 0..x_len {
-                            *basis_y_array_ptr.add(x_len - 1) += *basis_y_ptr.add(y_v)
-                                * *template_ptr.add(y_v * template_array.dim().1) as f64;
-                        }
-                        for (x_v, x_ind) in (x_start..x_stop).into_iter().enumerate() {
-                            *basis_values_ptr.add(bas) +=
-                                *basis_x_ptr.add(x_v) * *basis_y_array_ptr.add(x_v);
-                        }
-                    }
-                }
-            }
-
-            prev_y = **y;
-            prev_x = **x;
-            */
             convolve_at_one_point(
                 *x,
                 *y,
@@ -729,8 +709,6 @@ impl DiffKernel {
                 &mut basis_y_cache,
                 &template_f64,
             );
-
-            let basis_values_colum = basis_values.to_shape((basis_values.len(), 1)).unwrap();
 
             let poly_y_pos = ((**y as f32) - y_mid as f32) / y_mid as f32;
             let poly_x_pos = ((**x as f32) - x_mid as f32) / x_mid as f32;
@@ -751,25 +729,14 @@ impl DiffKernel {
                 }
             }
 
-            // let y_cheb_row = y_cheb.to_shape((1, y_cheb.len())).unwrap();
-            // let x_cheb_column = x_cheb.to_shape((x_cheb.len(), 1)).unwrap();
-
-            // let spatial_terms = x_cheb_column.dot(&y_cheb_row);
-            // let spatial_term_filtered = spatial_terms
-            //     .rows()
-            //     .into_iter()
-            //     .enumerate()
-            //     .map(|(index, row)| row.slice(s![0..row.len() - index]).to_owned())
-            //     .flat_map(|f| f.mapv(|v| v))
-            //     .collect::<Array1<f32>>();
-
-            // let spatial_terms_row = spatial_erms.to_shape((1, spatial_terms.len())).unwrap();
-            let spatial_terms_row = spatial_terms_filtered
-                .to_shape((1, spatial_terms_filtered.len()))
-                .unwrap();
-
-            let terms_m = &(basis_values_colum.dot(&spatial_terms_row));
-            terms.assign(&terms_m.flatten().mapv(|v| v as f32));
+            let mut k = 0;
+            for bas in 0..basis_len {
+                let bv_f32 = (basis_values[bas]) as f32;
+                for sp in 0..size {
+                    terms[k] = bv_f32 * (spatial_terms_filtered[sp] as f32);
+                    k += 1;
+                }
+            }
 
             let terms_len = terms.len();
             unsafe {
@@ -790,6 +757,7 @@ impl DiffKernel {
                 target_array[[(*y - kernel_width) as usize, (**x - kernel_width) as usize]];
             target_accumulator += &(&terms * target_value);
         }
+
         let mut incrementor: usize = 0;
         for i in 0..basis_accumulator.dim().0 {
             for j in i..basis_accumulator.dim().1 {
@@ -802,17 +770,10 @@ impl DiffKernel {
         }
 
         let coefficients = basis_accumulator.inv().unwrap().dot(&target_accumulator);
-        // let coefficients = target_accumulator;
+        // let coefficients = basis_accumulator.solve_into(target_accumulator).unwrap();
+
         println!("The coefficients are {coefficients:?}");
 
-        // let outer: Vec<Array2<f32>> = basis_arrays
-        //     .iter()
-        //     .map(|(y_basis, x_basis)| {
-        //         let y_colum = y_basis.to_shape((y_basis.len(), 1)).unwrap();
-        //         let x_row = x_basis.to_shape((1, x_basis.len())).unwrap();
-        //         y_colum.to_owned().dot(&x_row.to_owned()).mapv(|v| v as f32)
-        //     })
-        //     .collect();
         Ok(DiffKernel {
             basis_arrays: basis_arrays
                 .iter()
