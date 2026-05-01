@@ -126,7 +126,7 @@ impl ConvolveCache {
 ///
 /// After the function returns, regardless of which path was taken, `prev_x` and `prev_y`
 /// are updated so the next call can determine whether it is a cache hit or miss.
-#[inline(never)]
+#[inline(always)]
 fn convolve_at_one_point(
     x: &i32,
     y: &i32,
@@ -139,10 +139,11 @@ fn convolve_at_one_point(
     basis_y_cache: &mut ConvolveCache,
     input_array: &Array2<f64>,
 ) {
-    let y_start = *y - kernel_radius;
-
-    let x_start = *x - kernel_radius;
-    let x_stop = *x + kernel_radius + 1;
+    let y_start = (*y - kernel_radius) as usize;
+    let x_start = (*x - kernel_radius) as usize;
+    let x_stop = (*x + kernel_radius + 1) as usize;
+    let kernel_size = (2 * kernel_radius + 1) as usize;
+    let input_num_col = input_array.ncols();
 
     // need to zero of the basis_value to start as it will be set from previous loop
     basis_values.fill(0.0);
@@ -153,45 +154,32 @@ fn convolve_at_one_point(
         unsafe {
             //basis_values are the result of the convolution with each basis function
             let basis_values_ptr = basis_values.as_mut_ptr();
+            let input_base = input_array.as_ptr();
+            let cache_base = basis_y_cache.array.as_mut_ptr();
             // loop over each basis function number
             for bas in 0..basis_len {
                 let basis_y_ptr = basis_arrays[bas].0.as_ptr();
                 let basis_x_ptr = basis_arrays[bas].1.as_ptr();
                 // intermediate container for x kernel multiplied by template summed for each x
-                let basis_y_cache_ptr = basis_y_cache.array.get_mut_ptr((bas, 0)).unwrap();
-                for y_v in 0..2 * kernel_radius + 1 {
-                    let input_ptr = input_array
-                        .get_ptr(((y_start + y_v) as usize, x_start as usize))
-                        .unwrap();
-                    let basis_y_val = *basis_y_ptr.add(y_v as usize);
-                    for x_v in 0..2 * kernel_radius + 1 {
-                        *basis_y_cache_ptr.add(x_v as usize) +=
-                            *input_ptr.add(x_v as usize) as f64 * basis_y_val;
+                let basis_y_cache_ptr = cache_base.add(bas * kernel_size);
+                for y_v in 0..kernel_size {
+                    let input_ptr = input_base.add((y_start + y_v) * input_num_col + x_start);
+                    let basis_y_val = *basis_y_ptr.add(y_v);
+                    for x_v in 0..kernel_size {
+                        *basis_y_cache_ptr.add(x_v) += *input_ptr.add(x_v) as f64 * basis_y_val;
                     }
                 }
 
-                for x_v in 0..2 * kernel_radius + 1 {
-                    *basis_values_ptr.add(bas) +=
-                        *basis_x_ptr.add(x_v as usize) * *basis_y_cache_ptr.add(x_v as usize);
+                let mut acc = 0.0;
+                for x_v in 0..kernel_size {
+                    acc += *basis_x_ptr.add(x_v) * *basis_y_cache_ptr.add(x_v);
                 }
-
-                // for (x_v, x_ind) in (x_start..x_stop).into_iter().enumerate() {
-                //     let input_ptr = input_array
-                //         .get_ptr((y_start as usize, x_ind as usize))
-                //         .unwrap();
-                //     for y_v in 0..2 * kernel_radius + 1 {
-                //         *basis_y_cache_ptr.add(x_v as usize) +=
-                //             *input_ptr.add(y_v as usize * input_array.dim().1) as f64
-                //                 * *basis_y_ptr.add(y_v as usize);
-                //     }
-                //     *basis_values_ptr.add(bas) +=
-                //         *basis_x_ptr.add(x_v as usize) * *basis_y_cache_ptr.add(x_v as usize);
-                // }
+                *basis_values_ptr.add(bas) = acc;
             }
         }
     } else {
         unsafe {
-            let mut basis_values_ptr = basis_values.as_mut_ptr();
+            let basis_values_ptr = basis_values.as_mut_ptr();
 
             let x_len = basis_arrays[0].0.dim();
             let cache_offset = basis_y_cache.current_index;
@@ -199,52 +187,45 @@ fn convolve_at_one_point(
 
             let row_offset = input_array.dim().1;
 
+            let cache_base = basis_y_cache.array.as_mut_ptr();
+
             // grab the cache unfriendly code once up front instead of each loop
             let hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
+
             let mut input_ptr = input_array
-                .get_ptr((y_start as usize, (x_stop - 1) as usize))
-                .unwrap();
+                .as_ptr()
+                .add(y_start * input_num_col + (x_stop - 1));
             for hop in 0..x_len {
                 *hop_cache.add(hop) = *input_ptr;
                 input_ptr = input_ptr.add(row_offset);
             }
 
+            // let hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
             for bas in 0..basis_len {
-                // calculate the last y colum
-                // let mut input_ptr = input_array
-                //     .get_ptr((y_start as usize, (x_stop - 1) as usize))
-                //     .unwrap();
-                let mut hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
-                let mut basis_y_ptr = basis_arrays[bas].0.as_ptr();
+                let basis_y_ptr = basis_arrays[bas].0.as_ptr();
                 let basis_x_ptr = basis_arrays[bas].1.as_ptr();
-                let basis_y_cache_ptr = basis_y_cache.array.get_mut_ptr((bas, 0)).unwrap();
+                // let basis_y_cache_ptr = basis_y_cache.array.get_mut_ptr((bas, 0)).unwrap();
+                let basis_y_cache_ptr = cache_base.add(bas * x_len);
 
-                // set the current cache location to zero
-                let tmp_ptr = basis_y_cache_ptr.add(cache_offset);
-                *tmp_ptr = 0.0;
+                // fill in the new y cache column
                 let mut acc = 0.0;
-                for _ in 0..x_len {
-                    // acc += *basis_y_ptr * *input_ptr;
-                    acc += *basis_y_ptr * *hop_cache;
-                    // *tmp_ptr += *basis_y_ptr.add(y_v) * *input_ptr;
-                    basis_y_ptr = basis_y_ptr.add(1);
-                    hop_cache = hop_cache.add(1)
-                    // input_ptr = input_ptr.add(row_offset);
+                for count in 0..x_len {
+                    acc += *basis_y_ptr.add(count) * *hop_cache.add(count);
                 }
-                *tmp_ptr = acc;
+                *basis_y_cache_ptr.add(cache_offset) = acc;
 
                 // need to get cleaver to use the cache since the beginning is overwritten
                 let basis_y_cache_ptr_offset = basis_y_cache_ptr.add(existing_column_offset);
+                let mut basis_values_acc = 0.0;
                 for x_v in 0..(x_len - (cache_offset + 1)) {
-                    *basis_values_ptr += *basis_x_ptr.add(x_v) * *basis_y_cache_ptr_offset.add(x_v);
+                    basis_values_acc += *basis_x_ptr.add(x_v) * *basis_y_cache_ptr_offset.add(x_v);
                 }
 
                 let basis_x_ptr_offset = basis_x_ptr.add(x_len - (cache_offset + 1));
-                // let basis_values_ptr_offset = basis_values_ptr.add(x_len - existing_column_offset);
                 for x_v in 0..(cache_offset + 1) {
-                    *basis_values_ptr += *basis_x_ptr_offset.add(x_v) * *basis_y_cache_ptr.add(x_v);
+                    basis_values_acc += *basis_x_ptr_offset.add(x_v) * *basis_y_cache_ptr.add(x_v);
                 }
-                basis_values_ptr = basis_values_ptr.add(1);
+                *basis_values_ptr.add(bas) = basis_values_acc;
             }
             basis_y_cache.increment();
         }
@@ -444,6 +425,7 @@ impl DiffKernel {
 
                 let mut accu: f64 = 0.0;
 
+                /*
                 unsafe {
                     let mut coeff_ptr = self.basis_coeffients.as_ptr();
                     for basis_value in &basis_values {
@@ -455,6 +437,12 @@ impl DiffKernel {
                         }
                     }
                 }
+                */
+                let accu = Zip::from(&basis_values)
+                    .and(&spatial_terms_filtered)
+                    .and(&self.basis_coeffients.mapv(|v| v as f64))
+                    .map_collect(|bv, st, c| bv * st * c)
+                    .sum();
 
                 unsafe {
                     *output_array
@@ -693,6 +681,7 @@ impl DiffKernel {
         let mut prev_x = i32::MAX;
 
         let mut terms = Array1::<f32>::zeros(num_parameters);
+        let terms_len = num_parameters;
 
         let template_f64 = template_array.mapv(|v| v as f64);
 
@@ -729,27 +718,39 @@ impl DiffKernel {
                 }
             }
 
-            let mut k = 0;
-            for bas in 0..basis_len {
-                let bv_f32 = (basis_values[bas]) as f32;
-                for sp in 0..size {
-                    terms[k] = bv_f32 * (spatial_terms_filtered[sp] as f32);
-                    k += 1;
+            unsafe {
+                let mut k = 0;
+                let bv_ptr = basis_values.as_ptr();
+                let sp_term_filt_ptr = spatial_terms_filtered.as_ptr();
+                let terms_ptr = terms.as_mut_ptr();
+
+                for bas in 0..basis_len {
+                    // let bv_f32 = (basis_values[bas]) as f32;
+                    let bv_f32 = *bv_ptr.add(bas) as f32;
+                    for sp in 0..size {
+                        *terms_ptr.add(k) = bv_f32 * (*sp_term_filt_ptr.add(sp) as f32);
+                        k += 1;
+                    }
                 }
             }
 
-            let terms_len = terms.len();
             unsafe {
-                let mut basis_ptr = basis_accumulator_vec.as_mut_ptr();
-                let terms_ptr = terms.as_ptr();
-                // let mut incrementor: usize = 0;
-                for i in 0..terms_len {
+                let n = terms_len;
+                let basis_ptr_nn = ptr::NonNull::new_unchecked(basis_accumulator_vec.as_mut_ptr());
+                let terms_ptr_nn = ptr::NonNull::new_unchecked(terms.as_mut_ptr());
+                let basis_ptr = basis_ptr_nn.as_ptr();
+                let terms_ptr = terms_ptr_nn.as_ptr();
+
+                let mut offset = 0usize;
+                for i in 0..n {
+                    let row_len = n - i;
                     let term = *terms_ptr.add(i);
-                    // incrementor += i;
-                    for j in i..terms_len {
-                        *basis_ptr += (term * *terms_ptr.add(j));
-                        basis_ptr = basis_ptr.add(1);
+                    let local_basis_ptr = basis_ptr.add(offset);
+                    let local_term = terms_ptr.add(i);
+                    for k in 0..row_len {
+                        *local_basis_ptr.add(k) += term * *local_term.add(k);
                     }
+                    offset += row_len;
                 }
             }
 
@@ -759,18 +760,23 @@ impl DiffKernel {
         }
 
         let mut incrementor: usize = 0;
-        for i in 0..basis_accumulator.dim().0 {
-            for j in i..basis_accumulator.dim().1 {
-                let basis_value = basis_accumulator_vec[incrementor];
-                // basis_accumulator[[i, j]] = basis_accumulator[[j, i]];
-                basis_accumulator[[i, j]] = basis_value;
-                basis_accumulator[[j, i]] = basis_value;
-                incrementor += 1;
+        unsafe {
+            let basis_accumulator_vec_ptr = basis_accumulator_vec.as_ptr();
+            for i in 0..basis_accumulator.dim().0 {
+                for j in i..basis_accumulator.dim().1 {
+                    let basis_value = *basis_accumulator_vec_ptr.add(incrementor);
+                    // basis_accumulator[[i, j]] = basis_accumulator[[j, i]];
+                    basis_accumulator[[i, j]] = basis_value;
+                    basis_accumulator[[j, i]] = basis_value;
+                    incrementor += 1;
+                }
             }
         }
 
-        let coefficients = basis_accumulator.inv().unwrap().dot(&target_accumulator);
-        // let coefficients = basis_accumulator.solve_into(target_accumulator).unwrap();
+        // let coefficients = basis_accumulator.inv().unwrap().dot(&target_accumulator);
+        // solve is maringally slower, will need to understand why, or switch to it if
+        // there is numerical stability issues with inv
+        let coefficients = basis_accumulator.solve(&target_accumulator).unwrap();
 
         println!("The coefficients are {coefficients:?}");
 

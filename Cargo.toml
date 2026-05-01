@@ -33,3 +33,8 @@ python-source="python"
 opt-level = 3
 debug = false
 
+[profile.profiling]
+inherits = "release" # Start with release optimizations
+debug = true        # Enable debug symbols (crucial for flamegraphs)
+opt-level = 3       # Maximum optimization
+lto = "thin"

@@ -25,7 +25,7 @@ clean:
 # as a separate make target.
 _build: clean
 	@echo "Building wheel..."
-	maturin build -r --manylinux off
+	maturin build --manylinux off --profile profiling
 
 install: _build
 	@echo "Adding wheel to eups environment..."
