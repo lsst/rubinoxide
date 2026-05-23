@@ -143,7 +143,7 @@ fn convolve_at_one_point(
     let x_start = (*x - kernel_radius) as usize;
     let x_stop = (*x + kernel_radius + 1) as usize;
     let kernel_size = (2 * kernel_radius + 1) as usize;
-    let input_num_col = input_array.ncols();
+    let input_num_col = input_array.strides()[0] as usize;
 
     // need to zero of the basis_value to start as it will be set from previous loop
     basis_values.fill(0.0);
@@ -192,7 +192,7 @@ fn convolve_at_one_point(
             let cache_offset = basis_y_cache.current_index;
             let existing_column_offset = (cache_offset + 1) % basis_y_cache.pixel_size;
 
-            let row_offset = input_array.dim().1;
+            let row_offset = input_array.strides()[0] as usize;
 
             let cache_base = basis_y_cache.array.as_mut_ptr();
 
@@ -334,6 +334,10 @@ impl DiffKernel {
 // Implement all the methods that will be called from python
 #[pymethods]
 impl DiffKernel {
+    fn get_basis_coefficients<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.basis_coeffients.to_owned().into_pyarray(py)
+    }
+
     fn apply_kernel<'py>(
         &self,
         py: Python<'py>,
@@ -430,6 +434,7 @@ impl DiffKernel {
                     *output_array
                         .uget_mut([y_pos - self.basis_radius, x_pos - self.basis_radius]) = accu;
                 }
+
             }
         }
 
@@ -763,9 +768,6 @@ impl DiffKernel {
             }
         }
 
-        println!("the basis accumulator is {:?}", &basis_accumulator);
-        println!("\n");
-        println!("the target accumuator is {:?}", &target_accumulator);
         // let coefficients = basis_accumulator
         //     .mapv(|v| v as f64)
         //     .inv()
@@ -775,8 +777,6 @@ impl DiffKernel {
         // there is numerical stability issues with inv
         let coefficients = basis_accumulator.solve(&target_accumulator).unwrap();
         // let coefficients = target_accumulator;
-
-        println!("The coefficients are {coefficients:?}");
 
         Ok(DiffKernel {
             basis_arrays: basis_arrays
