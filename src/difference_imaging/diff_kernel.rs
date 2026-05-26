@@ -40,6 +40,7 @@ use numpy::Element;
 use ndarray_linalg::Solve;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
+use serde::{Serialize, Deserialize};
 
 struct ConvolveCache<T: NdFloat + Default> {
     array: Array2<T>,
@@ -228,6 +229,7 @@ fn convolve_at_one_point<T: NdFloat + Default>(
     *prev_x = *x;
 }
 
+#[derive(Serialize, Deserialize)]
 #[pyclass(name = "DiffKernel")]
 pub struct DiffKernelF64 {
     basis_arrays: Vec<(Array1<f64>, Array1<f64>)>,
@@ -236,6 +238,7 @@ pub struct DiffKernelF64 {
     basis_coefficients: Array1<f64>,
 }
 
+#[derive(Serialize, Deserialize)]
 #[pyclass(name = "DiffKernelF32")]
 pub struct DiffKernelF32 {
     basis_arrays: Vec<(Array1<f32>, Array1<f32>)>,
@@ -483,6 +486,19 @@ macro_rules! impl_diff_kernel_pymethods {
                     output += &self._draw_weighted_basis(index, y_pos, x_pos);
                 }
                 output.into_pyarray(py)
+            }
+
+            /// Serialize this kernel to a JSON string.
+            fn to_json(&self) -> PyResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            }
+
+            /// Deserialize a kernel from a JSON string.
+            #[staticmethod]
+            fn from_json(json_str: &str) -> PyResult<Self> {
+                serde_json::from_str(json_str)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
             }
 
 
@@ -911,4 +927,85 @@ pub fn generate_gauss_hermite_basis_f32<'py>(
     orders: Vec<usize>,
 ) -> Vec<(Bound<'py, PyArray1<f32>>, Bound<'py, PyArray1<f32>>)> {
     _generate_gauss_hermite_basis_inner(py, half_width, widths, orders)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_roundtrip_f64() {
+        let basis5 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let basis6 = Array1::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0]);
+        let coeff6 = Array1::from_vec(vec![0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]);
+
+        let kernel = DiffKernelF64 {
+            basis_arrays: vec![(basis5.clone(), basis6.clone()), (basis6, basis5)],
+            basis_radius: 2,
+            spatial_order: 1,
+            basis_coefficients: coeff6,
+        };
+
+        let json = serde_json::to_string(&kernel).unwrap();
+        let restored: DiffKernelF64 = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(kernel.basis_radius, restored.basis_radius);
+        assert_eq!(kernel.spatial_order, restored.spatial_order);
+        assert!(
+            kernel.basis_coefficients
+                .iter()
+                .zip(restored.basis_coefficients.iter())
+                .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0)
+        );
+        assert_eq!(kernel.basis_arrays.len(), restored.basis_arrays.len());
+        for ((oy, ox), (ry, rx)) in kernel
+            .basis_arrays
+            .iter()
+            .zip(restored.basis_arrays.iter())
+        {
+            assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+            assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+        }
+    }
+
+    #[test]
+    fn test_json_roundtrip_f32() {
+        let basis5 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let basis6 = Array1::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0]);
+        let coeff6 = Array1::from_vec(vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]);
+
+        let kernel = DiffKernelF32 {
+            basis_arrays: vec![(basis5.clone(), basis6.clone()), (basis6, basis5)],
+            basis_radius: 2,
+            spatial_order: 1,
+            basis_coefficients: coeff6,
+        };
+
+        let json = serde_json::to_string(&kernel).unwrap();
+        let restored: DiffKernelF32 = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(kernel.basis_radius, restored.basis_radius);
+        assert_eq!(kernel.spatial_order, restored.spatial_order);
+        assert!(
+            kernel.basis_coefficients
+                .iter()
+                .zip(restored.basis_coefficients.iter())
+                .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0)
+        );
+        assert_eq!(kernel.basis_arrays.len(), restored.basis_arrays.len());
+        for ((oy, ox), (ry, rx)) in kernel
+            .basis_arrays
+            .iter()
+            .zip(restored.basis_arrays.iter())
+        {
+            assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+            assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+        }
+    }
+
+    #[test]
+    fn test_from_json_invalid() {
+        let res: Result<DiffKernelF64, _> = serde_json::from_str("not valid json");
+        assert!(res.is_err());
+    }
 }

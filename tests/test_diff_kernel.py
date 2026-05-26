@@ -534,6 +534,48 @@ class DiffKernelConvolveTestCase(TestCase):
         self.assertEqual(rust_coeffs.shape[0], py_coeffs.shape[0])
         np.testing.assert_allclose(rust_coeffs, py_coeffs, rtol=1e-4, atol=1e-8)
 
+    def test_json_roundtrip_f64(self):
+        """Test that DiffKernel to_json/from_json round-trips correctly (f64)."""
+        np.random.seed(42)
+        template, target_sci, xind, yind, _ = self._build_synthetic_images()
+
+        basis = generate_gauss_hermite_basis(half_width=10.0, widths=[1.0, 2.0], orders=[1, 2])
+        spatial_order = 2
+
+        kernel = DiffKernel.solve_diff_kernel(
+            xind, yind, basis, spatial_order, template, target_sci
+        )
+
+        # Serialize to JSON
+        json_str = kernel.to_json()
+        self.assertIsInstance(json_str, str)
+        self.assertGreater(len(json_str), 0)
+
+        # Deserialize back
+        restored = DiffKernel.from_json(json_str)
+        self.assertIsInstance(restored, DiffKernel)
+
+        # Verify coefficients match
+        original_coeffs = kernel.get_basis_coefficients()
+        restored_coeffs = restored.get_basis_coefficients()
+        np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
+
+        # Verify apply_kernel produces same output on a test image
+        test_image = template.astype(np.float64)
+        out_original = kernel.apply_kernel(test_image)
+        out_restored = restored.apply_kernel(test_image)
+        np.testing.assert_allclose(out_original, out_restored, rtol=1e-8, atol=1e-10)
+
+    def test_json_roundtrip_invalid_json(self):
+        """Test that DiffKernel.from_json raises on invalid JSON."""
+        with self.assertRaises(ValueError):
+            DiffKernel.from_json("this is not valid json")
+        with self.assertRaises(ValueError):
+            DiffKernel.from_json("{}")
+        with self.assertRaises(ValueError):
+            DiffKernel.from_json("[]")
+
+
 # ---------------------------------------------------------------------------
 # Module boilerplate
 # ---------------------------------------------------------------------------
