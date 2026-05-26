@@ -57,6 +57,12 @@ try:
 except AttributeError:
     DiffKernelF32 = None
 
+# deserialize_diff_kernel may not be exported in all builds; guard gracefully
+try:
+    deserialize_diff_kernel = dk.deserialize_diff_kernel
+except AttributeError:
+    deserialize_diff_kernel = None
+
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
@@ -535,7 +541,7 @@ class DiffKernelConvolveTestCase(TestCase):
         np.testing.assert_allclose(rust_coeffs, py_coeffs, rtol=1e-4, atol=1e-8)
 
     def test_json_roundtrip_f64(self):
-        """Test that DiffKernel to_json/from_json round-trips correctly (f64)."""
+        """Test that DiffKernel json/from_json round-trips correctly (f64)."""
         np.random.seed(42)
         template, target_sci, xind, yind, _ = self._build_synthetic_images()
 
@@ -547,9 +553,14 @@ class DiffKernelConvolveTestCase(TestCase):
         )
 
         # Serialize to JSON
-        json_str = kernel.to_json()
+        json_str = kernel.json()
         self.assertIsInstance(json_str, str)
         self.assertGreater(len(json_str), 0)
+
+        # Verify JSON contains the "dtype" field
+        import json
+        parsed = json.loads(json_str)
+        self.assertEqual(parsed.get("dtype"), "DiffKernel")
 
         # Deserialize back
         restored = DiffKernel.from_json(json_str)
@@ -566,6 +577,13 @@ class DiffKernelConvolveTestCase(TestCase):
         out_restored = restored.apply_kernel(test_image)
         np.testing.assert_allclose(out_original, out_restored, rtol=1e-8, atol=1e-10)
 
+        # Test deserialize_diff_kernel dispatch
+        if deserialize_diff_kernel is not None:
+            dispatched = deserialize_diff_kernel(json_str)
+            self.assertIsInstance(dispatched, DiffKernel)
+            dispatched_coeffs = dispatched.get_basis_coefficients()
+            np.testing.assert_allclose(original_coeffs, dispatched_coeffs, rtol=1e-10, atol=1e-12)
+
     def test_json_roundtrip_invalid_json(self):
         """Test that DiffKernel.from_json raises on invalid JSON."""
         with self.assertRaises(ValueError):
@@ -574,6 +592,91 @@ class DiffKernelConvolveTestCase(TestCase):
             DiffKernel.from_json("{}")
         with self.assertRaises(ValueError):
             DiffKernel.from_json("[]")
+
+    def test_deserialize_diff_kernel_dispatch_f64(self):
+        """Test that deserialize_diff_kernel correctly dispatches an f64 kernel."""
+        if deserialize_diff_kernel is None:
+            self.skipTest("deserialize_diff_kernel not available in current build")
+
+        np.random.seed(42)
+        template, target_sci, xind, yind, _ = self._build_synthetic_images()
+
+        basis = generate_gauss_hermite_basis(half_width=10.0, widths=[1.0, 2.0], orders=[1, 2])
+        spatial_order = 2
+
+        kernel = DiffKernel.solve_diff_kernel(
+            xind, yind, basis, spatial_order, template, target_sci
+        )
+
+        json_str = kernel.json()
+
+        # Dispatch should return a DiffKernel instance
+        restored = deserialize_diff_kernel(json_str)
+        self.assertIsInstance(restored, DiffKernel)
+
+        # Verify coefficients match
+        original_coeffs = kernel.get_basis_coefficients()
+        restored_coeffs = restored.get_basis_coefficients()
+        np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
+
+        # Verify apply_kernel produces same output
+        out_original = kernel.apply_kernel(template.astype(np.float64))
+        out_restored = restored.apply_kernel(template.astype(np.float64))
+        np.testing.assert_allclose(out_original, out_restored, rtol=1e-8, atol=1e-10)
+
+    def test_deserialize_diff_kernel_dispatch_f32(self):
+        """Test that deserialize_diff_kernel correctly dispatches an f32 kernel."""
+        if DiffKernelF32 is None:
+            self.skipTest("DiffKernelF32 not exported in current build")
+        if deserialize_diff_kernel is None:
+            self.skipTest("deserialize_diff_kernel not available in current build")
+
+        np.random.seed(42)
+        template, target_sci, xind, yind, _ = self._build_synthetic_images()
+        template_f32 = template.astype(np.float32)
+        target_f32 = target_sci.astype(np.float32)
+
+        basis_f64 = generate_gauss_hermite_basis(half_width=10.0, widths=[1.0, 2.0], orders=[1, 2])
+        basis_f32 = [
+            (y_k.astype(np.float32), x_k.astype(np.float32))
+            for y_k, x_k in basis_f64
+        ]
+        spatial_order = 2
+
+        kernel = DiffKernelF32.solve_diff_kernel(
+            xind, yind, basis_f32, spatial_order, template_f32, target_f32
+        )
+
+        json_str = kernel.json()
+
+        # Dispatch should return a DiffKernelF32 instance
+        restored = deserialize_diff_kernel(json_str)
+        self.assertIsInstance(restored, DiffKernelF32)
+
+        # Verify apply_kernel produces same output (f32 tolerance)
+        out_original = kernel.apply_kernel(template_f32)
+        out_restored = restored.apply_kernel(template_f32)
+        np.testing.assert_allclose(out_original, out_restored, rtol=1e-4, atol=1e-4)
+
+    def test_deserialize_diff_kernel_invalid(self):
+        """Test that deserialize_diff_kernel raises on invalid input."""
+        if deserialize_diff_kernel is None:
+            self.skipTest("deserialize_diff_kernel not available in current build")
+
+        # Invalid JSON
+        with self.assertRaises(ValueError):
+            deserialize_diff_kernel("not valid json")
+
+        # Missing dtype field (legacy format not supported by dispatcher)
+        with self.assertRaises(ValueError):
+            deserialize_diff_kernel("{}")
+
+        # Wrong dtype value
+        with self.assertRaises(ValueError):
+            import json as _json
+            bad = {"dtype": "DiffKernelF16", "basis_arrays": [], "basis_radius": 0,
+                   "spatial_order": 0, "basis_coefficients": []}
+            deserialize_diff_kernel(_json.dumps(bad))
 
 
 # ---------------------------------------------------------------------------

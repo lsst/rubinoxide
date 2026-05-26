@@ -247,6 +247,24 @@ pub struct DiffKernelF32 {
     basis_coefficients: Array1<f32>,
 }
 
+/// Serialization wrapper that adds a "dtype" tag to identify f64 vs f32 kernels.
+#[derive(Serialize, Deserialize)]
+struct TypedDiffKernelF64 {
+    #[serde(rename = "dtype")]
+    dtype_value: String,
+    #[serde(flatten)]
+    data: DiffKernelF64,
+}
+
+/// Serialization wrapper that adds a "dtype" tag to identify f64 vs f32 kernels.
+#[derive(Serialize, Deserialize)]
+struct TypedDiffKernelF32 {
+    #[serde(rename = "dtype")]
+    dtype_value: String,
+    #[serde(flatten)]
+    data: DiffKernelF32,
+}
+
 // Macro to generate the pure-Rust impl block for both DiffKernelF64 and DiffKernelF32
 macro_rules! impl_diff_kernel_methods {
     ($struct_name:ident, $T:ty) => {
@@ -340,10 +358,10 @@ impl_diff_kernel_methods!(DiffKernelF32, f32);
 // already disambiguates.
 //
 // Invocation:
-//   impl_diff_kernel_pymethods!(DiffKernelF64, f64);
-//   impl_diff_kernel_pymethods!(DiffKernelF32, f32);
+//   impl_diff_kernel_pymethods!(DiffKernelF64, f64, TypedDiffKernelF64, "DiffKernel");
+//   impl_diff_kernel_pymethods!(DiffKernelF32, f32, TypedDiffKernelF32, "DiffKernelF32");
 macro_rules! impl_diff_kernel_pymethods {
-    ($struct_name:ident, $T:ty) => {
+    ($struct_name:ident, $T:ty, $wrapped_type:ident, $type_tag:expr) => {
         #[pymethods]
         impl $struct_name {
             fn get_basis_coefficients<'py>(
@@ -488,17 +506,30 @@ macro_rules! impl_diff_kernel_pymethods {
                 output.into_pyarray(py)
             }
 
-            /// Serialize this kernel to a JSON string.
-            fn to_json(&self) -> PyResult<String> {
-                serde_json::to_string(self)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            /// Serialize this kernel to a JSON string with a type discriminator.
+            fn json(&self) -> PyResult<String> {
+                let data = serde_json::to_value(self)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize kernel: {}", e)))?;
+                let mut map = serde_json::Map::new();
+                map.insert("dtype".to_string(), serde_json::Value::String($type_tag.to_string()));
+                if let serde_json::Value::Object(obj) = data {
+                    for (k, v) in obj {
+                        map.insert(k, v);
+                    }
+                }
+                let final_value = serde_json::Value::Object(map);
+                serde_json::to_string(&final_value)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to format JSON: {}", e)))
             }
 
-            /// Deserialize a kernel from a JSON string.
+            /// Deserialize a kernel from a JSON string with a "dtype" tag.
             #[staticmethod]
             fn from_json(json_str: &str) -> PyResult<Self> {
-                serde_json::from_str(json_str)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+                let value: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
+                let wrapper: $wrapped_type = serde_json::from_value(value)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to deserialize kernel: {}", e)))?;
+                Ok(wrapper.data)
             }
 
 
@@ -692,8 +723,64 @@ macro_rules! impl_diff_kernel_pymethods {
     };
 }
 
-impl_diff_kernel_pymethods!(DiffKernelF64, f64);
-impl_diff_kernel_pymethods!(DiffKernelF32, f32);
+impl_diff_kernel_pymethods!(DiffKernelF64, f64, TypedDiffKernelF64, "DiffKernel");
+impl_diff_kernel_pymethods!(DiffKernelF32, f32, TypedDiffKernelF32, "DiffKernelF32");
+
+/// Enum to hold either kernel variant for the dispatcher.
+enum EitherKernel {
+    F64(DiffKernelF64),
+    F32(DiffKernelF32),
+}
+
+/// Internal dispatcher that inspects a JSON string and deserializes the
+/// appropriate kernel type based on the `"dtype"` discriminator field.
+fn parse_and_deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<EitherKernel> {
+    let value: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
+
+    match value.get("dtype").and_then(|v| v.as_str()) {
+        Some("DiffKernel") => {
+            let wrapper: TypedDiffKernelF64 = serde_json::from_value(value)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
+                    "Failed to deserialize DiffKernel: {}", e)))?;
+            Ok(EitherKernel::F64(wrapper.data))
+        }
+        Some("DiffKernelF32") => {
+            let wrapper: TypedDiffKernelF32 = serde_json::from_value(value)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
+                    "Failed to deserialize DiffKernelF32: {}", e)))?;
+            Ok(EitherKernel::F32(wrapper.data))
+        }
+        Some(unknown) => {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown kernel dtype '{}'. Expected 'DiffKernel' or 'DiffKernelF32'",
+                unknown)))
+        }
+        None => {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "JSON missing required 'dtype' field."))
+        }
+    }
+}
+
+/// Inspects a serialized kernel JSON string and returns the correct kernel
+/// type (`DiffKernel` or `DiffKernelF32`) based on the embedded `"dtype"` tag.
+///
+/// Raises `ValueError` if the JSON is invalid, missing the dtype tag, or
+/// contains an unrecognized type.
+#[pyfunction]
+pub fn deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<PyObject> {
+    let either = parse_and_deserialize_diff_kernel(py, json_str)?;
+    match either {
+        EitherKernel::F64(kernel) => {
+            Ok(Py::new(py, kernel)?.into())
+        }
+        EitherKernel::F32(kernel) => {
+            Ok(Py::new(py, kernel)?.into())
+        }
+    }
+}
+
 /// Fast convolution between an image and a kernel using FFT.
 ///
 /// # Parameters
@@ -1007,5 +1094,106 @@ mod tests {
     fn test_from_json_invalid() {
         let res: Result<DiffKernelF64, _> = serde_json::from_str("not valid json");
         assert!(res.is_err());
+    }
+
+    /// Test that tagged serialization (via TypedDiffKernel wrapper) produces correct "dtype".
+    #[test]
+    fn test_tagged_serialize_f64() {
+        let kernel = create_test_kernel_f64();
+        let wrapper = TypedDiffKernelF64 {
+            dtype_value: "DiffKernel".to_string(),
+            data: kernel,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
+        assert!(value.get("basis_radius").is_some());
+        assert!(value.get("basis_arrays").is_some());
+    }
+
+    /// Test that tagged serialization (via TypedDiffKernel wrapper) produces correct "dtype".
+    #[test]
+    fn test_tagged_serialize_f32() {
+        let kernel = create_test_kernel_f32();
+        let wrapper = TypedDiffKernelF32 {
+            dtype_value: "DiffKernelF32".to_string(),
+            data: kernel,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernelF32"));
+    }
+
+    /// Test round-trip through TypedDiffKernelF64 wrapper.
+    #[test]
+    fn test_roundtrip_via_typed_wrapper_f64() {
+        let original = create_test_kernel_f64();
+        let wrapper = TypedDiffKernelF64 {
+            dtype_value: "DiffKernel".to_string(),
+            data: original,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        let restored: TypedDiffKernelF64 = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.dtype_value, "DiffKernel");
+        assert_eq!(restored.data.basis_radius, 2);
+        assert_eq!(restored.data.spatial_order, 1);
+    }
+
+    /// Test round-trip through TypedDiffKernelF32 wrapper.
+    #[test]
+    fn test_roundtrip_via_typed_wrapper_f32() {
+        let original = create_test_kernel_f32();
+        let wrapper = TypedDiffKernelF32 {
+            dtype_value: "DiffKernelF32".to_string(),
+            data: original,
+        };
+        let json = serde_json::to_string(&wrapper).unwrap();
+        let restored: TypedDiffKernelF32 = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.dtype_value, "DiffKernelF32");
+        assert_eq!(restored.data.basis_radius, 2);
+    }
+
+    /// Test that the to_json_map utility function produces correct tagged output for f64.
+    /// This mirrors what the `json` pymethod does.
+    #[test]
+    fn test_to_json_map_approach_f64() {
+        let kernel = create_test_kernel_f64();
+        let data = serde_json::to_value(&kernel).unwrap();
+        let mut map = serde_json::Map::new();
+        map.insert("dtype".to_string(), serde_json::Value::String("DiffKernel".to_string()));
+        if let serde_json::Value::Object(obj) = data {
+            for (k, v) in obj {
+                map.insert(k, v);
+            }
+        }
+        let final_value = serde_json::Value::Object(map);
+        let json = serde_json::to_string(&final_value).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
+        assert!(parsed.get("basis_radius").is_some());
+    }
+
+    fn create_test_kernel_f64() -> DiffKernelF64 {
+        let basis1 = Array1::from_vec(vec![1.0f64, 2.0, 3.0, 4.0, 5.0]);
+        let basis2 = Array1::from_vec(vec![5.0f64, 4.0, 3.0, 2.0, 1.0]);
+        let coeffs = Array1::from_vec(vec![0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        DiffKernelF64 {
+            basis_arrays: vec![(basis1, basis2)],
+            basis_radius: 2,
+            spatial_order: 1,
+            basis_coefficients: coeffs,
+        }
+    }
+
+    fn create_test_kernel_f32() -> DiffKernelF32 {
+        let basis1 = Array1::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        let basis2 = Array1::from_vec(vec![5.0f32, 4.0, 3.0, 2.0, 1.0]);
+        let coeffs = Array1::from_vec(vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        DiffKernelF32 {
+            basis_arrays: vec![(basis1, basis2)],
+            basis_radius: 2,
+            spatial_order: 1,
+            basis_coefficients: coeffs,
+        }
     }
 }
