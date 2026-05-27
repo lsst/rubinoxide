@@ -35,7 +35,6 @@ use ndarray::NdFloat;
 use ndarray::{prelude::*, Zip};
 use ndarray::{Array1, Array2};
 use num_traits::{NumCast, One};
-use ndarray_conv::{ConvFFTExt, ConvMode, FftProcessor, PaddingMode};
 use numpy::Element;
 use ndarray_linalg::Solve;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -1223,102 +1222,6 @@ pub fn deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<PyObj
             Ok(Py::new(py, kernel)?.into())
         }
     }
-}
-
-/// FFT-based convolution of an image with a kernel (float32 variant).
-///
-/// Convolution is performed via ``ndarray_conv`` using zero-padding with
-/// ``"same"`` output mode so the result has the same shape as the input.
-/// This function is exposed as ``my_convolve`` in the Python module.
-///
-/// Parameters
-/// ----------
-/// input_image : ``numpy.ndarray`` of float32
-///     2-D input image to convolve.
-/// input_kernel : ``numpy.ndarray`` of float32
-///     2-D convolution kernel.
-///
-/// Returns
-/// -------
-/// ``numpy.ndarray`` of float32
-///     2-D convolved output array with the same shape as ``input_image``.
-///
-/// Examples
-/// --------
-/// >>> from rubinoxide import my_convolve
-/// >>> result = my_convolve(image, kernel)
-/// >>> result.shape == image.shape
-/// True
-#[pyfunction]
-#[pyo3(name = "my_convolve")]
-pub fn my_convolve_f32<'py>(
-    py: Python<'py>,
-    input_image: PyReadonlyArray2<f32>,
-    input_kernel: PyReadonlyArray2<f32>,
-) -> Bound<'py, PyArray2<f32>> {
-    let mut processor = FftProcessor::<f32>::default();
-
-    input_image
-        .as_array()
-        .conv_fft_with_processor(
-            &input_kernel.as_array(),
-            ConvMode::Same,
-            PaddingMode::Zeros,
-            &mut processor,
-        )
-        .unwrap()
-        .into_pyarray(py)
-}
-
-/// FFT-based convolution of an image with a kernel (float64 variant).
-///
-/// Convolution is performed via ``ndarray_conv`` using zero-padding with
-/// ``"same"`` output mode so the result has the same shape as the input.
-///
-/// Parameters
-/// ----------
-/// input_image : ``numpy.ndarray`` of float64
-///     2-D input image to convolve.
-/// input_kernel : ``numpy.ndarray`` of float64
-///     2-D convolution kernel.
-///
-/// Returns
-/// -------
-/// ``numpy.ndarray`` of float64
-///     2-D convolved output array with the same shape as ``input_image``.
-///
-/// See Also
-/// --------
-/// my_convolve
-    /// Float32 variant, also aliased as ``my_convolve`` in the Python module.
-///
-/// Examples
-/// --------
-/// >>> from rubinoxide import my_convolve_f64
-/// >>> import numpy as np
-/// >>> image = np.random.rand(100, 100).astype(np.float64)
-/// >>> kernel_vals = np.random.rand(5, 5).astype(np.float64)
-/// >>> result = my_convolve_f64(image, kernel_vals)
-/// >>> result.shape == image.shape
-/// True
-#[pyfunction]
-pub fn my_convolve_f64<'py>(
-    py: Python<'py>,
-    input_image: PyReadonlyArray2<f64>,
-    input_kernel: PyReadonlyArray2<f64>,
-) -> Bound<'py, PyArray2<f64>> {
-    let mut processor = FftProcessor::<f64>::default();
-
-    input_image
-        .as_array()
-        .conv_fft_with_processor(
-            &input_kernel.as_array(),
-            ConvMode::Same,
-            PaddingMode::Zeros,
-            &mut processor,
-        )
-        .unwrap()
-        .into_pyarray(py)
 }
 
 /// Computes the nth Hermite polynomial at x using recurrence.

@@ -33,7 +33,7 @@ extern crate openblas_src;
 use diff_kernel::{
     DiffKernelF32, DiffKernelF64, deserialize_diff_kernel,
     generate_gauss_hermite_basis_f32,
-    generate_gauss_hermite_basis_f64, my_convolve_f32, my_convolve_f64,
+    generate_gauss_hermite_basis_f64,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::types::IntoPyDict;
@@ -43,8 +43,6 @@ pub fn create_diff_kernel_module(parent_module: &Bound<'_, PyModule>) -> PyResul
     let diff_module = PyModule::new(parent_module.py(), "difference_kernel")?;
     diff_module.add_class::<DiffKernelF64>()?;
     diff_module.add_class::<DiffKernelF32>()?;
-    diff_module.add_function(wrap_pyfunction!(my_convolve_f32, &diff_module)?)?;
-    diff_module.add_function(wrap_pyfunction!(my_convolve_f64, &diff_module)?)?;
     diff_module.add_function(wrap_pyfunction!(
         generate_gauss_hermite_basis_f64,
         &diff_module
