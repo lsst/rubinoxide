@@ -229,7 +229,7 @@ fn convolve_at_one_point<T: NdFloat + Default>(
     *prev_x = *x;
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[pyclass(name = "DiffKernel")]
 pub struct DiffKernelF64 {
     basis_arrays: Vec<(Array1<f64>, Array1<f64>)>,
@@ -238,7 +238,7 @@ pub struct DiffKernelF64 {
     basis_coefficients: Array1<f64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[pyclass(name = "DiffKernelF32")]
 pub struct DiffKernelF32 {
     basis_arrays: Vec<(Array1<f32>, Array1<f32>)>,
@@ -530,6 +530,174 @@ macro_rules! impl_diff_kernel_pymethods {
                 let wrapper: $wrapped_type = serde_json::from_value(value)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to deserialize kernel: {}", e)))?;
                 Ok(wrapper.data)
+            }
+
+            /// Provide Pydantic v2 integration — builds a
+            /// `pydantic_core.core_schema.CoreSchema` so that this type
+            /// can be used as a field type in `pydantic.BaseModel` classes.
+            ///
+            /// Called by Pydantic v2 with the signature:
+            ///   `__get_pydantic_core_schema__(cls, handler, source_type)`
+            /// where `handler` is the Pydantic handler (unused here — we build
+            /// the schema directly via pydantic_core.core_schema).
+            #[classmethod]
+            fn __get_pydantic_core_schema__(
+                _cls: &Bound<'_, pyo3::types::PyType>,
+                py: Python<'_>,
+                _handler: &Bound<'_, PyAny>,
+                _source_type: &Bound<'_, PyAny>,
+            ) -> PyResult<PyObject> {
+                let cs = py.import("pydantic_core.core_schema")?;
+                let json_mod = py.import("json")?;
+
+                let code = r#"
+def _build_schema(cls, cs, json_mod, type_err):
+    def _validate(v):
+        if isinstance(v, cls):
+            return v
+        if isinstance(v, dict):
+            return cls.from_json(json_mod.dumps(v))
+        if isinstance(v, str):
+            return cls.from_json(v)
+        raise type_err(
+            f"Cannot convert {type(v).__name__} to {cls.__name__}. "
+            f"Expected a {cls.__name__} instance, dict, or JSON string."
+        )
+
+    def _serialize(v):
+        if isinstance(v, cls):
+            return json_mod.loads(v.json())
+        return v
+
+    return cs.json_or_python_schema(
+        json_schema=cs.no_info_plain_validator_function(_validate),
+        python_schema=cs.union_schema([
+            cs.is_instance_schema(cls),
+            cs.no_info_plain_validator_function(_validate),
+        ]),
+        serialization=cs.plain_serializer_function_ser_schema(
+            _serialize,
+            return_schema=cs.dict_schema(),
+            when_used="always",
+        ),
+    )
+"#;
+
+                let builtins = py.import("builtins")?;
+                let locals_dict = pyo3::types::PyDict::new(py);
+                let cls_ref = _cls;
+                locals_dict.set_item("cls", cls_ref)?;
+                locals_dict.set_item("cs", &cs)?;
+                locals_dict.set_item("json_mod", &json_mod)?;
+                locals_dict.set_item("type_err", py.get_type::<pyo3::exceptions::PyTypeError>())?;
+
+                builtins.call_method1("exec", (code, &locals_dict))?;
+
+                let builder = locals_dict.get_item("_build_schema")?
+                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                        "Failed to define _build_schema in exec"))?;
+
+                let schema = builder.call1((
+                    cls_ref,
+                    &cs,
+                    &json_mod,
+                    py.get_type::<pyo3::exceptions::PyTypeError>(),
+                ))?;
+
+                Ok(schema.into())
+            }
+
+             /// Provide JSON Schema for OpenAPI / Pydantic documentation.
+            ///
+            /// Called by Pydantic v2 with:
+            ///   `__get_pydantic_json_schema__(cls, core_schema, handler)`
+            #[classmethod]
+            fn __get_pydantic_json_schema__(
+                _cls: &Bound<'_, pyo3::types::PyType>,
+                py: Python<'_>,
+                _core_schema: &Bound<'_, PyAny>,
+                _handler: &Bound<'_, PyAny>,
+            ) -> PyResult<PyObject> {
+                let json_schema_value = serde_json::json!({
+                    "type": "object",
+                    "title": $type_tag,
+                    "description": format!("Serialized {} kernel (dict format)", $type_tag),
+                    "properties": {
+                        "dtype": {"type": "string", "const": $type_tag},
+                        "basis_arrays": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "number"}
+                                }
+                            }
+                        },
+                        "basis_radius": {"type": "integer", "minimum": 0},
+                        "spatial_order": {"type": "integer", "minimum": 0},
+                        "basis_coefficients": {
+                            "type": "array",
+                            "items": {"type": "number"}
+                        }
+                    },
+                    "required": ["dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients"]
+                });
+
+                let json_str = serde_json::to_string(&json_schema_value)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
+                        "Failed to serialize JSON schema: {}", e)))?;
+
+                let json_mod = py.import("json")?;
+                let py_dict = json_mod.call_method1("loads", (&json_str,))?;
+                Ok(py_dict.into())
+            }
+
+            /// Pydantic-style classmethod: validate and construct from data.
+            ///
+            /// Accepts a DiffKernel instance (pass-through), a dict, or a
+            /// JSON string.  Mirrors `pydantic.BaseModel.model_validate`.
+            #[classmethod]
+            fn model_validate(
+                _cls: &Bound<'_, pyo3::types::PyType>,
+                py: Python<'_>,
+                data: &Bound<'_, PyAny>,
+            ) -> PyResult<Self> {
+                // Already an instance of the correct type?
+                if data.is_instance(_cls)? {
+                    return data.extract::<Self>();
+                }
+
+                // String? → treat as JSON
+                if data.is_instance_of::<pyo3::types::PyString>() {
+                    let json_str: &str = data.extract()?;
+                    return Self::from_json(json_str);
+                }
+
+                // Dict → serialize to JSON, then from_json
+                if data.is_instance_of::<pyo3::types::PyDict>() {
+                    let json_mod = py.import("json")?;
+                    let json_str_obj = json_mod.call_method1("dumps", (data,))?;
+                    let json_str: String = json_str_obj.extract()?;
+                    return Self::from_json(&json_str);
+                }
+
+                let type_name = data.get_type().name()?;
+                Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "model_validate expects a {} instance, dict, or JSON string. Got {}.",
+                    std::any::type_name::<Self>(),
+                    type_name
+                )))
+            }
+
+            /// Pydantic-style method: serialize kernel to a Python dict.
+            ///
+            /// Mirrors `pydantic.BaseModel.model_dump`.
+            fn model_dump(&self, py: Python<'_>) -> PyResult<PyObject> {
+                let json_str = self.json()?;
+                let json_mod = py.import("json")?;
+                let py_dict = json_mod.call_method1("loads", (&json_str,))?;
+                Ok(py_dict.into())
             }
 
 
