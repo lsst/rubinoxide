@@ -364,6 +364,22 @@ macro_rules! impl_diff_kernel_pymethods {
     ($struct_name:ident, $T:ty, $wrapped_type:ident, $type_tag:expr) => {
         #[pymethods]
         impl $struct_name {
+            /// Return the basis coefficients array fitted during ``solve_diff_kernel``.
+            ///
+            /// Returns the 1-D array of learned kernel coefficients that weight each
+            /// basis function expanded over the spatial Chebyshev polynomial grid.
+            ///
+            /// Returns
+            /// -------
+            /// ``numpy.ndarray`` of float
+            ///     1-D array of basis coefficients. The dtype matches the kernel type
+            ///     (``float64`` for ``DiffKernel``, ``float32`` for ``DiffKernelF32``).
+            ///
+            /// Examples
+            /// --------
+            /// >>> coeffs = kernel.get_basis_coefficients()
+            /// >>> print(coeffs.shape)
+            /// (6,)
             fn get_basis_coefficients<'py>(
                 &self,
                 py: Python<'py>,
@@ -371,6 +387,40 @@ macro_rules! impl_diff_kernel_pymethods {
                 self.basis_coefficients.to_owned().into_pyarray(py)
             }
 
+            /// Apply the learned difference kernel to an input image.
+            ///
+            /// Convolves ``input_image`` with the spatially-varying difference kernel
+            /// using the basis functions and coefficients learned by
+            /// ``solve_diff_kernel``. The kernel position is normalized relative
+            /// to the image center using Chebyshev polynomials.
+            ///
+            /// Parameters
+            /// ----------
+            /// input_image : ``numpy.ndarray``
+            ///     2-D input image to process. The dtype must match the kernel type
+            ///     (``float64`` for ``DiffKernel``, ``float32`` for ``DiffKernelF32``).
+            ///
+            /// Returns
+            /// -------
+            /// ``numpy.ndarray``
+            ///     2-D convolved output array. Its shape is shrunk by
+            ///     ``2 * basis_radius`` in each dimension compared to ``input_image``,
+            ///     i.e. ``(H - 2*R, W - 2*R)`` where ``R`` is the basis radius.
+            ///
+            /// Examples
+            /// --------
+            /// >>> from rubinoxide import DiffKernel
+            /// >>> kernel = DiffKernel.solve_diff_kernel(...)
+            /// >>> result = kernel.apply_kernel(science_image)
+            /// >>> print(result.shape)
+            /// (3960, 3960)
+            ///
+            /// Raises
+            /// ------
+            /// ValueError
+            ///     If *input_image* is smaller than ``2 * basis_radius`` in either
+            ///     dimension (would cause integer underflow in output shape
+            ///     computation).
             fn apply_kernel<'py>(
                 &self,
                 py: Python<'py>,
@@ -474,6 +524,26 @@ macro_rules! impl_diff_kernel_pymethods {
                 output_array.into_pyarray(py)
             }
 
+            /// Return a single basis function (without spatial weighting or learned coefficients).
+            ///
+            /// Returns the 2-D outer product of the y- and x-components of the
+            /// basis function at the given index, with no multiplication by the
+            /// learned coefficient or any spatial Chebyshev weighting.
+            ///
+            /// Parameters
+            /// ----------
+            /// index : int
+            ///     Index of the basis function to draw (0-based).
+            ///
+            /// Returns
+            /// -------
+            /// ``numpy.ndarray``
+            ///     2-D array of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+            ///
+            /// Raises
+            /// ------
+            /// IndexError
+            ///     If *index* is out of range for the stored basis functions.
             fn draw_unweighted_basis<'py>(
                 &self,
                 py: Python<'py>,
@@ -482,6 +552,36 @@ macro_rules! impl_diff_kernel_pymethods {
                 self._draw_unweighted_basis(index).into_pyarray(py)
             }
 
+            /// Return a single basis function weighted by spatial position and learned coefficients.
+            ///
+            /// Returns the 2-D outer product of the y- and x-components of the
+            /// basis function at the given index, scaled by the corresponding
+            /// learned coefficient and the spatial Chebyshev polynomial term
+            /// evaluated at ``(y_pos, x_pos)``.
+            ///
+            /// Parameters
+            /// ----------
+            /// index : int
+            ///     Index of the weighted basis function to draw (0-based).
+            /// y_pos : float
+            ///     Y position (normalized pixel coordinate) for spatial weighting.
+            ///     Should be in ``[-1, +1]`` relative to image center for correct
+            ///     Chebyshev polynomial evaluation.
+            /// x_pos : float
+            ///     X position (normalized pixel coordinate) for spatial weighting.
+            ///     Should be in ``[-1, +1]`` relative to image center for correct
+            ///     Chebyshev polynomial evaluation.
+            ///
+            /// Returns
+            /// -------
+            /// ``numpy.ndarray``
+            ///     2-D weighted basis function array of shape
+            ///     ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+            ///
+            /// Raises
+            /// ------
+            /// IndexError
+            ///     If *index* is out of range for the stored basis functions.
             fn draw_weighted_basis<'py>(
                 &self,
                 py: Python<'py>,
@@ -492,6 +592,33 @@ macro_rules! impl_diff_kernel_pymethods {
                 self._draw_weighted_basis(index, y_pos, x_pos).into_pyarray(py)
             }
 
+            /// Return the composite difference kernel at a given spatial position.
+            ///
+            /// Sums all weighted basis functions evaluated at ``(y_pos, x_pos)`` to
+            /// produce the full spatially-varying difference kernel. Each basis
+            /// function is scaled by its learned coefficient and the corresponding
+            /// Chebyshev spatial polynomial evaluated at the given position.
+            ///
+            /// Parameters
+            /// ----------
+            /// y_pos : float
+            ///     Y position (normalized pixel coordinate) for spatial weighting.
+            ///     Should be in ``[-1, +1]`` relative to image center for correct
+            ///     Chebyshev polynomial evaluation.
+            /// x_pos : float
+            ///     X position (normalized pixel coordinate) for spatial weighting.
+            ///     Should be in ``[-1, +1]`` relative to image center for correct
+            ///     Chebyshev polynomial evaluation.
+            ///
+            /// Returns
+            /// -------
+            /// ``numpy.ndarray``
+            ///     2-D composite kernel of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+            ///
+            /// See Also
+            /// --------
+            /// draw_weighted_basis
+            ///     Return an individual weighted basis function instead of the sum.
             fn draw_kernel<'py>(
                 &self,
                 py: Python<'py>,
@@ -507,6 +634,20 @@ macro_rules! impl_diff_kernel_pymethods {
             }
 
             /// Serialize this kernel to a JSON string with a type discriminator.
+            ///
+            /// Embeds a ``"dtype"`` field in the JSON output to identify the kernel
+            /// variant (``DiffKernel`` or ``DiffKernelF32``), enabling correct
+            /// type dispatch during deserialization.
+            ///
+            /// Returns
+            /// -------
+            /// str
+            ///     JSON string representation of the kernel including the dtype tag.
+            ///
+            /// Raises
+            /// ------
+            /// ValueError
+            ///     If serialization fails.
             fn json(&self) -> PyResult<String> {
                 let data = serde_json::to_value(self)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize kernel: {}", e)))?;
@@ -522,7 +663,26 @@ macro_rules! impl_diff_kernel_pymethods {
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to format JSON: {}", e)))
             }
 
-            /// Deserialize a kernel from a JSON string with a "dtype" tag.
+            /// Deserialize a kernel from a JSON string.
+            ///
+            /// Parses the JSON string and reconstructs the kernel instance. The JSON
+            /// must contain a ``"dtype"`` field matching this kernel type.
+            ///
+            /// Parameters
+            /// ----------
+            /// json_str : str
+            ///     JSON string containing serialized kernel data.
+            ///
+            /// Returns
+            /// -------
+            /// kernel instance
+            ///     Reconstructed kernel of the matching type.
+            ///
+            /// Raises
+            /// ------
+            /// ValueError
+            ///     If the JSON is invalid, deserialization fails, or the ``dtype`` is
+            ///     unrecognized.
             #[staticmethod]
             fn from_json(json_str: &str) -> PyResult<Self> {
                 let value: serde_json::Value = serde_json::from_str(json_str)
@@ -653,10 +813,28 @@ def _build_schema(cls, cs, json_mod, type_err):
                 Ok(py_dict.into())
             }
 
-            /// Pydantic-style classmethod: validate and construct from data.
+            /// Validate and construct a kernel instance from data.
             ///
-            /// Accepts a DiffKernel instance (pass-through), a dict, or a
-            /// JSON string.  Mirrors `pydantic.BaseModel.model_validate`.
+            /// Pydantic-style classmethod that accepts a kernel instance (pass-through),
+            /// a dict, or a JSON string. Mirrors ``pydantic.BaseModel.model_validate``.
+            ///
+            /// Parameters
+            /// ----------
+            /// data : one of ``DiffKernel``, ``dict``, ``str``
+            ///     The data to validate. If a kernel instance, it is returned directly.
+            ///     If a dict, it is serialized to JSON then deserialized. If a string,
+            ///     it is treated as a JSON string.
+            ///
+            /// Returns
+            /// -------
+            /// kernel instance
+            ///     The constructed or pass-through kernel object.
+            ///
+            /// Raises
+            /// ------
+            /// TypeError
+            ///     If *data* type is not supported (not a kernel instance, dict, or
+            ///     string).
             #[classmethod]
             fn model_validate(
                 _cls: &Bound<'_, pyo3::types::PyType>,
@@ -690,9 +868,22 @@ def _build_schema(cls, cs, json_mod, type_err):
                 )))
             }
 
-            /// Pydantic-style method: serialize kernel to a Python dict.
+            /// Serialize kernel to a Python dict.
             ///
-            /// Mirrors `pydantic.BaseModel.model_dump`.
+            /// Pydantic-style method that returns a dictionary representation of the
+            /// kernel, including all fields and the dtype tag. Mirrors
+            /// ``pydantic.BaseModel.model_dump``.
+            ///
+            /// Returns
+            /// -------
+            /// ``dict``
+            ///     Dictionary representation of the kernel with all fields including
+            ///     the dtype tag.
+            ///
+            /// Raises
+            /// ------
+            /// ValueError
+            ///     If serialization fails.
             fn model_dump(&self, py: Python<'_>) -> PyResult<PyObject> {
                 let json_str = self.json()?;
                 let json_mod = py.import("json")?;
@@ -701,10 +892,71 @@ def _build_schema(cls, cs, json_mod, type_err):
             }
 
 
-            /// of note, the template_image dimensions are larger than the target image dimensions by
-            /// the width of the basis function -1. I.e. if the target image is 4000x4000 and the
-            /// basis function is len 21, template_image will have dimensions of 4020x4020 so there will
-            /// always be pixels to convolve with
+            /// Fit difference kernel coefficients by solving a linear system.
+            ///
+            /// Given point source positions and template/target image pairs, solves for
+            /// the set of basis coefficients that best model the difference between the
+            /// template and target images. Each basis function is expanded over spatial
+            /// Chebyshev polynomial terms up to the specified order, allowing the kernel
+            /// to vary across the image.
+            ///
+            /// The template image dimensions must be larger than the target image
+            /// dimensions by ``basis_function_width - 1``. For example, if the target
+            /// image is 4000x4000 and the basis function has length 21, the template
+            /// image should have dimensions 4020x4020 so that there are always pixels
+            /// available to convolve at every valid position.
+            ///
+            /// Parameters
+            /// ----------
+            /// x_values : ``numpy.ndarray`` of int
+            ///     X coordinates of point sources in pixel coordinates.
+            /// y_values : ``numpy.ndarray`` of int
+            ///     Y coordinates of point sources in pixel coordinates.
+            /// basis_functions : list of tuple of ``numpy.ndarray``, ``numpy.ndarray``
+            ///     Separable (y, x) basis function pairs. Each tuple contains two 1-D
+            ///     arrays representing the y-axis and x-axis components of a Gaussian
+            ///     Hermite basis function.
+            /// spatial_order : int
+            ///     Maximum order of the Chebyshev spatial polynomial model. Controls
+            ///     the spatial variability of the difference kernel.
+            /// template_image : ``numpy.ndarray`` of float
+            ///     Reference/template image. Must be at least ``basis_function_width - 1``
+            ///     pixels larger in each dimension than ``target_image``. The dtype must
+            ///     match the kernel type (``float64`` for ``DiffKernel``, ``float32``
+            ///     for ``DiffKernelF32``).
+            /// target_image : ``numpy.ndarray`` of float
+            ///     Science/target image to be difference-imaged against the template.
+            ///     The dtype must match the kernel type (``float64`` for ``DiffKernel``,
+            ///     ``float32`` for ``DiffKernelF32``).
+            ///
+            /// Returns
+            /// -------
+            /// ``DiffKernel`` or ``DiffKernelF32``
+            ///     The fitted kernel object containing the learned basis coefficients,
+            ///     basis functions, spatial order, and kernel radius.
+            ///
+            /// See Also
+            /// --------
+            /// generate_gauss_hermite_basis
+            ///     Precompute Gaussian-Hermite basis functions for use here.
+            /// DiffKernel.apply_kernel
+            ///     Apply the fitted kernel to difference an image.
+            ///
+            /// Examples
+            /// --------
+            /// >>> from rubinoxide import DiffKernel, generate_gauss_hermite_basis
+            /// >>> basis = generate_gauss_hermite_basis(10, [0.5, 1.0, 2.0], [12, 12, 12])
+            /// >>> kernel = DiffKernel.solve_diff_kernel(
+            /// ...     psf_x, psf_y, basis, 3, template, target
+            /// ... )
+            /// >>> coeffs = kernel.get_basis_coefficients()
+            ///
+            /// Raises
+            /// ------
+            /// ValueError
+            ///     If the linear system is singular (e.g., insufficient or
+            ///     degenerate point sources). Also raised if all point sources
+            ///     are filtered out due to being too close to boundaries.
             #[staticmethod]
             fn solve_diff_kernel(
                 x_values: PyReadonlyArray1<i32>,
@@ -931,11 +1183,35 @@ fn parse_and_deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult
     }
 }
 
-/// Inspects a serialized kernel JSON string and returns the correct kernel
-/// type (`DiffKernel` or `DiffKernelF32`) based on the embedded `"dtype"` tag.
+/// Deserialize a difference kernel from a JSON string, dispatching to the correct type.
 ///
-/// Raises `ValueError` if the JSON is invalid, missing the dtype tag, or
-/// contains an unrecognized type.
+/// Reads the ``"dtype"`` tag embedded in the JSON to determine whether the
+/// kernel is a ``DiffKernel`` (float64) or ``DiffKernelF32`` (float32) instance,
+/// then reconstructs and returns it.
+///
+/// Parameters
+/// ----------
+/// json_str : str
+///     JSON string containing serialized kernel data, including a ``"dtype"``
+///     field with value ``"DiffKernel"`` or ``"DiffKernelF32"``.
+///
+/// Returns
+/// -------
+/// ``DiffKernel`` or ``DiffKernelF32``
+///     Reconstructed kernel instance matching the dtype in the JSON payload.
+///
+/// Raises
+/// ------
+/// ValueError
+///     If the JSON is invalid, missing the ``"dtype"`` field, or contains an
+///     unrecognized type value.
+///
+/// Examples
+/// --------
+/// >>> kernel_json = kernel.json()
+/// >>> restored = deserialize_diff_kernel(kernel_json)
+/// >>> type(restored)
+/// <class 'DiffKernel'>
 #[pyfunction]
 pub fn deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<PyObject> {
     let either = parse_and_deserialize_diff_kernel(py, json_str)?;
@@ -949,17 +1225,30 @@ pub fn deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<PyObj
     }
 }
 
-/// Fast convolution between an image and a kernel using FFT.
+/// FFT-based convolution of an image with a kernel (float32 variant).
 ///
-/// # Parameters
-/// input_image : numpy.ndarray  (float32)
-///     The input image to convolve.
-/// input_kernel : numpy.ndarray  (float32)
-///     The convolution kernel (float32).
+/// Convolution is performed via ``ndarray_conv`` using zero-padding with
+/// ``"same"`` output mode so the result has the same shape as the input.
+/// This function is exposed as ``my_convolve`` in the Python module.
 ///
-/// # Returns
-/// numpy.ndarray  (float32)
-///     The convolved output with the same shape as ``input_image``.
+/// Parameters
+/// ----------
+/// input_image : ``numpy.ndarray`` of float32
+///     2-D input image to convolve.
+/// input_kernel : ``numpy.ndarray`` of float32
+///     2-D convolution kernel.
+///
+/// Returns
+/// -------
+/// ``numpy.ndarray`` of float32
+///     2-D convolved output array with the same shape as ``input_image``.
+///
+/// Examples
+/// --------
+/// >>> from rubinoxide import my_convolve
+/// >>> result = my_convolve(image, kernel)
+/// >>> result.shape == image.shape
+/// True
 #[pyfunction]
 #[pyo3(name = "my_convolve")]
 pub fn my_convolve_f32<'py>(
@@ -981,17 +1270,37 @@ pub fn my_convolve_f32<'py>(
         .into_pyarray(py)
 }
 
-/// Fast convolution between an image and a kernel using FFT (f64 variant).
+/// FFT-based convolution of an image with a kernel (float64 variant).
 ///
-/// # Parameters
-/// input_image : numpy.ndarray  (float64)
-///     The input image to convolve.
-/// input_kernel : numpy.ndarray  (float64)
-///     The convolution kernel (float64).
+/// Convolution is performed via ``ndarray_conv`` using zero-padding with
+/// ``"same"`` output mode so the result has the same shape as the input.
 ///
-/// # Returns
-/// numpy.ndarray  (float64)
-///     The convolved output with the same shape as ``input_image``.
+/// Parameters
+/// ----------
+/// input_image : ``numpy.ndarray`` of float64
+///     2-D input image to convolve.
+/// input_kernel : ``numpy.ndarray`` of float64
+///     2-D convolution kernel.
+///
+/// Returns
+/// -------
+/// ``numpy.ndarray`` of float64
+///     2-D convolved output array with the same shape as ``input_image``.
+///
+/// See Also
+/// --------
+/// my_convolve
+    /// Float32 variant, also aliased as ``my_convolve`` in the Python module.
+///
+/// Examples
+/// --------
+/// >>> from rubinoxide import my_convolve_f64
+/// >>> import numpy as np
+/// >>> image = np.random.rand(100, 100).astype(np.float64)
+/// >>> kernel_vals = np.random.rand(5, 5).astype(np.float64)
+/// >>> result = my_convolve_f64(image, kernel_vals)
+/// >>> result.shape == image.shape
+/// True
 #[pyfunction]
 pub fn my_convolve_f64<'py>(
     py: Python<'py>,
@@ -1106,9 +1415,9 @@ where
 ///     Standard deviation (sigma) of the Gaussian envelope for each basis
 ///     family.
 /// orders : list of int
-///     Maximum Hermite order for each corresponding width (same length as
-///     ``widths``). Each width-ordered pair generates a triangular set of
-///     y- and x-Hermite polynomials as described above.
+///     Maximum Hermite order for each corresponding width (must be the same
+///     length as ``widths``). Each width-ordered pair generates a triangular
+///     set of y- and x-Hermite polynomials as described above.
 ///
 /// Returns
 /// -------
@@ -1148,6 +1457,7 @@ pub fn generate_gauss_hermite_basis_f64<'py>(
 /// Creates a list of separable 1D basis function pairs (y, x) by combining
 /// a Gaussian envelope with Hermite polynomials. Each basis spans
 /// ``2 * half_width + 1`` integer grid points from -half_width to +half_width.
+/// All returned arrays use ``float32`` dtype.
 ///
 /// The basis uses a triangular ordering: for each (width, order) pair
 /// the y-direction generates Hermite polynomials of orders ``0..order``,
@@ -1164,16 +1474,34 @@ pub fn generate_gauss_hermite_basis_f64<'py>(
 ///     Standard deviation (sigma) of the Gaussian envelope for each basis
 ///     family.
 /// orders : list of int
-///     Maximum Hermite order for each corresponding width (same length as
-///     ``widths``). Each width-ordered pair generates a triangular set of
-///     y- and x-Hermite polynomials as described above.
+///     Maximum Hermite order for each corresponding width (must be the same
+///     length as ``widths``). Each width-ordered pair generates a triangular
+///     set of y- and x-Hermite polynomials as described above.
 ///
 /// Returns
 /// -------
-/// list of tuple of numpy.ndarray
+/// list of tuple of ``numpy.ndarray`` of float32
 ///     Each element is a ``(y_kernel, x_kernel)`` pair. Each kernel is a
-///     1-D NumPy array of length ``2 * half_width + 1`` representing a
-///     Gaussian-weighted Hermite polynomial.
+///     1-D NumPy array of length ``2 * half_width + 1`` with dtype ``float32``
+///     representing a Gaussian-weighted Hermite polynomial.
+///
+/// See Also
+/// --------
+/// generate_gauss_hermite_basis
+///     Float64 variant, also aliased as ``generate_gauss_hermite_basis``.
+/// DiffKernelF32.solve_diff_kernel
+///     Fits optimal kernel coefficients against template/target images.
+///
+/// Examples
+/// --------
+/// >>> basis = generate_gauss_hermite_basis_f32(2.0, [0.5, 1.0], [1, 2])
+/// >>> len(basis)
+/// 9
+/// >>> y_k, x_k = basis[0]
+/// >>> y_k.shape
+/// (5,)
+/// >>> y_k.dtype
+/// dtype('float32')
 #[pyfunction]
 pub fn generate_gauss_hermite_basis_f32<'py>(
     py: Python<'py>,
