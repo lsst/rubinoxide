@@ -34,12 +34,12 @@ use std::ptr;
 use ndarray::NdFloat;
 use ndarray::{prelude::*, Zip};
 use ndarray::{Array1, Array2};
+use ndarray_linalg::{Scalar, Solve};
 use num_traits::NumCast;
 use numpy::Element;
-use ndarray_linalg::{Scalar, Solve};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 struct ConvolveCache<T: NdFloat + Default> {
     array: Array2<T>,
@@ -187,9 +187,7 @@ fn convolve_at_one_point<T: NdFloat + Default>(
             // grab the cache unfriendly code once up front instead of each loop
             let hop_cache = basis_y_cache.y_hop_cache.as_mut_ptr();
 
-            let mut input_ptr = input_array
-                .as_ptr()
-                .add(y_start * n_cols + (x_stop - 1));
+            let mut input_ptr = input_array.as_ptr().add(y_start * n_cols + (x_stop - 1));
             for hop in 0..kernel_size {
                 *hop_cache.add(hop) = *input_ptr;
                 input_ptr = input_ptr.add(row_offset);
@@ -238,6 +236,7 @@ pub struct DiffKernelData<T: NdFloat + Default + NumCast> {
     pub basis_radius: usize,
     pub spatial_order: u32,
     pub basis_coefficients: Array1<T>,
+    pub reduced_chisq: T,
 }
 
 // ---------------------------------------------------------------------------
@@ -380,12 +379,12 @@ where
 
         for y_pos in self.basis_radius..input_shape.0 - self.basis_radius {
             for x_pos in self.basis_radius..input_shape.1 - self.basis_radius {
-                let poly_y_pos =
-                    (<T as NumCast>::from(y_pos).unwrap() - <T as NumCast>::from(y_mid).unwrap())
-                        / <T as NumCast>::from(y_mid).unwrap();
-                let poly_x_pos =
-                    (<T as NumCast>::from(x_pos).unwrap() - <T as NumCast>::from(x_mid).unwrap())
-                        / <T as NumCast>::from(x_mid).unwrap();
+                let poly_y_pos = (<T as NumCast>::from(y_pos).unwrap()
+                    - <T as NumCast>::from(y_mid).unwrap())
+                    / <T as NumCast>::from(y_mid).unwrap();
+                let poly_x_pos = (<T as NumCast>::from(x_pos).unwrap()
+                    - <T as NumCast>::from(x_mid).unwrap())
+                    / <T as NumCast>::from(x_mid).unwrap();
 
                 self._populate_spatial_terms(
                     poly_y_pos,
@@ -420,10 +419,8 @@ where
                 }
 
                 unsafe {
-                    *output_array.uget_mut([
-                        y_pos - self.basis_radius,
-                        x_pos - self.basis_radius,
-                    ]) = accu;
+                    *output_array
+                        .uget_mut([y_pos - self.basis_radius, x_pos - self.basis_radius]) = accu;
                 }
             }
         }
@@ -479,8 +476,7 @@ where
     let num_parameters = size * basis_len;
 
     let mut basis_accumulator = Array2::<T>::zeros((num_parameters, num_parameters));
-    let mut basis_accumulator_vec =
-        Array1::<T>::zeros(num_parameters * (num_parameters + 1) / 2);
+    let mut basis_accumulator_vec = Array1::<T>::zeros(num_parameters * (num_parameters + 1) / 2);
     let mut target_accumulator = Array1::<T>::zeros(num_parameters);
 
     let mut spatial_terms_filtered = Array1::<T>::zeros(size);
@@ -494,7 +490,11 @@ where
     let mut terms = Array1::<T>::zeros(num_parameters);
     let terms_len = num_parameters;
 
+    let mut pixel_counter = 0usize;
+    let mut sum_sq_response = <T>::default();
+
     for (x, y) in &xy_positions {
+        pixel_counter += 1;
         convolve_at_one_point(
             x,
             y,
@@ -503,14 +503,19 @@ where
             kernel_radius,
             basis_len,
             &mut basis_values,
-            &basis_functions.iter().map(|(y, x)| (y.view(), x.view())).collect(),
+            &basis_functions
+                .iter()
+                .map(|(y, x)| (y.view(), x.view()))
+                .collect(),
             &mut basis_y_cache,
             &template_image,
         );
 
-        let poly_y_pos = (<T as NumCast>::from(**y).unwrap() - <T as NumCast>::from(y_mid).unwrap())
+        let poly_y_pos = (<T as NumCast>::from(**y).unwrap()
+            - <T as NumCast>::from(y_mid).unwrap())
             / <T as NumCast>::from(y_mid).unwrap();
-        let poly_x_pos = (<T as NumCast>::from(**x).unwrap() - <T as NumCast>::from(x_mid).unwrap())
+        let poly_x_pos = (<T as NumCast>::from(**x).unwrap()
+            - <T as NumCast>::from(x_mid).unwrap())
             / <T as NumCast>::from(x_mid).unwrap();
 
         y_cheb[1] = poly_y_pos;
@@ -518,11 +523,9 @@ where
         for i in 2..spatial_order + 1 {
             let i = i as usize;
             y_cheb[i] =
-                <T as NumCast>::from(2).unwrap() * poly_y_pos * y_cheb[i - 1]
-                    - y_cheb[i - 2];
+                <T as NumCast>::from(2).unwrap() * poly_y_pos * y_cheb[i - 1] - y_cheb[i - 2];
             x_cheb[i] =
-                <T as NumCast>::from(2).unwrap() * poly_x_pos * x_cheb[i - 1]
-                    - x_cheb[i - 2];
+                <T as NumCast>::from(2).unwrap() * poly_x_pos * x_cheb[i - 1] - x_cheb[i - 2];
         }
 
         let mut index: usize = 0;
@@ -551,8 +554,7 @@ where
 
         unsafe {
             let n = terms_len;
-            let basis_ptr_nn =
-                ptr::NonNull::new_unchecked(basis_accumulator_vec.as_mut_ptr());
+            let basis_ptr_nn = ptr::NonNull::new_unchecked(basis_accumulator_vec.as_mut_ptr());
             let terms_ptr_nn = ptr::NonNull::new_unchecked(terms.as_mut_ptr());
             let basis_ptr = basis_ptr_nn.as_ptr();
             let terms_ptr = terms_ptr_nn.as_ptr();
@@ -570,11 +572,12 @@ where
             }
         }
 
-        let target_value = target_image[[
+        let target_value: T = target_image[[
             (*y - kernel_radius) as usize,
             (**x - kernel_radius) as usize,
         ]];
         target_accumulator += &(&terms * target_value);
+        sum_sq_response += target_value * target_value;
     }
 
     let mut incrementor: usize = 0;
@@ -593,6 +596,10 @@ where
 
     let coefficients = basis_accumulator.solve(&target_accumulator).unwrap();
 
+    let fit_power = coefficients.dot(&target_accumulator);
+    let chisq = sum_sq_response - fit_power;
+    let reduced_chisq = chisq / T::from(pixel_counter - num_parameters).unwrap();
+
     DiffKernelData {
         basis_arrays: basis_functions
             .iter()
@@ -601,6 +608,7 @@ where
         basis_radius: kernel_radius as usize,
         spatial_order,
         basis_coefficients: coefficients,
+        reduced_chisq,
     }
 }
 
@@ -634,12 +642,8 @@ impl DiffKernel {
     /// (6,)
     fn get_basis_coefficients<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         match &self.inner {
-            DiffKernelInner::F64(k) => {
-                Ok(k.basis_coefficients.clone().into_pyarray(py).into())
-            }
-            DiffKernelInner::F32(k) => {
-                Ok(k.basis_coefficients.clone().into_pyarray(py).into())
-            }
+            DiffKernelInner::F64(k) => Ok(k.basis_coefficients.clone().into_pyarray(py).into()),
+            DiffKernelInner::F32(k) => Ok(k.basis_coefficients.clone().into_pyarray(py).into()),
         }
     }
 
@@ -733,12 +737,8 @@ impl DiffKernel {
     ///     If *index* is out of range for the stored basis functions.
     fn draw_unweighted_basis<'py>(&self, py: Python<'py>, index: usize) -> PyResult<PyObject> {
         match &self.inner {
-            DiffKernelInner::F64(k) => {
-                Ok(k._draw_unweighted_basis(index).into_pyarray(py).into())
-            }
-            DiffKernelInner::F32(k) => {
-                Ok(k._draw_unweighted_basis(index).into_pyarray(py).into())
-            }
+            DiffKernelInner::F64(k) => Ok(k._draw_unweighted_basis(index).into_pyarray(py).into()),
+            DiffKernelInner::F32(k) => Ok(k._draw_unweighted_basis(index).into_pyarray(py).into()),
         }
     }
 
@@ -780,8 +780,14 @@ impl DiffKernel {
         x_pos: f64,
     ) -> PyResult<PyObject> {
         match &self.inner {
-            DiffKernelInner::F64(k) => Ok(k._draw_weighted_basis(index, y_pos, x_pos).into_pyarray(py).into()),
-            DiffKernelInner::F32(k) => Ok(k._draw_weighted_basis(index, y_pos as f32, x_pos as f32).into_pyarray(py).into()),
+            DiffKernelInner::F64(k) => Ok(k
+                ._draw_weighted_basis(index, y_pos, x_pos)
+                .into_pyarray(py)
+                .into()),
+            DiffKernelInner::F32(k) => Ok(k
+                ._draw_weighted_basis(index, y_pos as f32, x_pos as f32)
+                .into_pyarray(py)
+                .into()),
         }
     }
 
@@ -815,7 +821,8 @@ impl DiffKernel {
     fn draw_kernel<'py>(&self, py: Python<'py>, y_pos: f64, x_pos: f64) -> PyResult<PyObject> {
         match &self.inner {
             DiffKernelInner::F64(k) => {
-                let mut output = Array2::<f64>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
+                let mut output =
+                    Array2::<f64>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
                 for index in 0..k.basis_coefficients.len() {
                     output += &k._draw_weighted_basis(index, y_pos, x_pos);
                 }
@@ -824,7 +831,8 @@ impl DiffKernel {
             DiffKernelInner::F32(k) => {
                 let y_f32 = y_pos as f32;
                 let x_f32 = x_pos as f32;
-                let mut output = Array2::<f32>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
+                let mut output =
+                    Array2::<f32>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
                 for index in 0..k.basis_coefficients.len() {
                     output += &k._draw_weighted_basis(index, y_f32, x_f32);
                 }
@@ -876,10 +884,7 @@ impl DiffKernel {
     #[staticmethod]
     fn from_json(json_str: &str) -> PyResult<Self> {
         let inner: DiffKernelInner = serde_json::from_str(json_str).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "Failed to deserialize kernel: {}",
-                e
-            ))
+            pyo3::exceptions::PyValueError::new_err(format!("Failed to deserialize kernel: {}", e))
         })?;
         Ok(DiffKernel { inner })
     }
@@ -941,18 +946,13 @@ def _build_schema(cls, cs, json_mod, type_err):
         locals_dict.set_item("cls", cls_ref)?;
         locals_dict.set_item("cs", &cs)?;
         locals_dict.set_item("json_mod", &json_mod)?;
-        locals_dict.set_item(
-            "type_err",
-            py.get_type::<pyo3::exceptions::PyTypeError>(),
-        )?;
+        locals_dict.set_item("type_err", py.get_type::<pyo3::exceptions::PyTypeError>())?;
 
         builtins.call_method1("exec", (code, &locals_dict))?;
 
-        let builder = locals_dict
-            .get_item("_build_schema")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Failed to define _build_schema in exec")
-            })?;
+        let builder = locals_dict.get_item("_build_schema")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Failed to define _build_schema in exec")
+        })?;
 
         let schema = builder.call1((
             cls_ref,
@@ -1002,15 +1002,18 @@ def _build_schema(cls, cs, json_mod, type_err):
                 },
                 "basis_radius": {"type": "integer", "minimum": 0},
                 "spatial_order": {"type": "integer", "minimum": 0},
-                "basis_coefficients": ndarray_obj_schema.clone()
+                "basis_coefficients": ndarray_obj_schema.clone(),
+                "reduced_chisq": {"type": "number"}
             },
             "required": ["dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients"]
         });
 
-        let json_str = serde_json::to_string(&json_schema_value)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
-                "Failed to serialize JSON schema: {}", e
-            )))?;
+        let json_str = serde_json::to_string(&json_schema_value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to serialize JSON schema: {}",
+                e
+            ))
+        })?;
 
         let json_mod = py.import("json")?;
         let py_dict = json_mod.call_method1("loads", (&json_str,))?;
@@ -1243,8 +1246,7 @@ fn hermite_polynomial<T: NdFloat + Default>(x: T, n: usize, amplitude: T) -> T {
             let mut h1 = two * x * amplitude;
             for i in 2..=n {
                 let is = <T as NumCast>::from(i).unwrap();
-                let h2 = (two / is).sqrt() * x * h1
-                    - ((is - one) / is).sqrt() * h0;
+                let h2 = (two / is).sqrt() * x * h1 - ((is - one) / is).sqrt() * h0;
                 h0 = h1;
                 h1 = h2;
             }
@@ -1264,8 +1266,9 @@ where
 {
     let num_points = 2 * (half_width as isize) as usize + 1;
     let hw = T::from(half_width).unwrap();
-    let x_values: Array1<T> =
-        (0..num_points).map(|i| -hw + T::from(i as f64).unwrap()).collect();
+    let x_values: Array1<T> = (0..num_points)
+        .map(|i| -hw + T::from(i as f64).unwrap())
+        .collect();
 
     let mut basis_kernels = Vec::new();
 
@@ -1276,11 +1279,9 @@ where
         // Compute Gaussian envelope in f64 (where exp/sqrt are natively available),
         // then cast to T. This preserves exact numerical results across f32/f64.
         let norm_factor = sigma_f64 * (2.0_f64 * std::f64::consts::PI).sqrt();
-        let x_values_f64: Array1<f64> =
-            (0..num_points).map(|i| -half_width + (i as f64)).collect();
-        let gauss_term_f64 = x_values_f64.mapv(|x| {
-            ((-x.powi(2) / (2.0 * sigma_f64.powi(2))).exp()) / norm_factor
-        });
+        let x_values_f64: Array1<f64> = (0..num_points).map(|i| -half_width + (i as f64)).collect();
+        let gauss_term_f64 =
+            x_values_f64.mapv(|x| ((-x.powi(2) / (2.0 * sigma_f64.powi(2))).exp()) / norm_factor);
         let gauss_term: Array1<T> = gauss_term_f64.mapv(|v| T::from(v).unwrap());
 
         for j in 0..order {
@@ -1467,13 +1468,15 @@ mod tests {
                     .zip(r.basis_coefficients.iter())
                     .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
                 assert_eq!(o.basis_arrays.len(), r.basis_arrays.len());
-                for ((oy, ox), (ry, rx)) in o
-                    .basis_arrays
-                    .iter()
-                    .zip(r.basis_arrays.iter())
-                {
-                    assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
-                    assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+                for ((oy, ox), (ry, rx)) in o.basis_arrays.iter().zip(r.basis_arrays.iter()) {
+                    assert!(oy
+                        .iter()
+                        .zip(ry.iter())
+                        .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+                    assert!(ox
+                        .iter()
+                        .zip(rx.iter())
+                        .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
                 }
             }
             _ => panic!("Expected F64 variant"),
@@ -1497,13 +1500,15 @@ mod tests {
                     .zip(r.basis_coefficients.iter())
                     .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
                 assert_eq!(o.basis_arrays.len(), r.basis_arrays.len());
-                for ((oy, ox), (ry, rx)) in o
-                    .basis_arrays
-                    .iter()
-                    .zip(r.basis_arrays.iter())
-                {
-                    assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
-                    assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+                for ((oy, ox), (ry, rx)) in o.basis_arrays.iter().zip(r.basis_arrays.iter()) {
+                    assert!(oy
+                        .iter()
+                        .zip(ry.iter())
+                        .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+                    assert!(ox
+                        .iter()
+                        .zip(rx.iter())
+                        .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
                 }
             }
             _ => panic!("Expected F32 variant"),
@@ -1524,7 +1529,10 @@ mod tests {
         let json_str = serde_json::to_string(&tagged).unwrap();
         // Verify the JSON has the correct dtype tag
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
+        assert_eq!(
+            value.get("dtype").and_then(|v| v.as_str()),
+            Some("DiffKernel")
+        );
         // Deserialize back
         let result: DiffKernelInner = serde_json::from_str(&json_str).unwrap();
         match result {
@@ -1545,7 +1553,10 @@ mod tests {
         let json_str = serde_json::to_string(&tagged).unwrap();
         // Verify the JSON has the correct dtype tag
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernelF32"));
+        assert_eq!(
+            value.get("dtype").and_then(|v| v.as_str()),
+            Some("DiffKernelF32")
+        );
         // Deserialize back
         let result: DiffKernelInner = serde_json::from_str(&json_str).unwrap();
         match result {
@@ -1596,7 +1607,10 @@ mod tests {
         let tagged = DiffKernelInner::F64(original);
         let json = serde_json::to_string(&tagged).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
+        assert_eq!(
+            value.get("dtype").and_then(|v| v.as_str()),
+            Some("DiffKernel")
+        );
         assert!(value.get("basis_radius").is_some());
         assert!(value.get("basis_arrays").is_some());
     }
@@ -1607,7 +1621,10 @@ mod tests {
         let tagged = DiffKernelInner::F32(original);
         let json = serde_json::to_string(&tagged).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernelF32"));
+        assert_eq!(
+            value.get("dtype").and_then(|v| v.as_str()),
+            Some("DiffKernelF32")
+        );
         assert!(value.get("basis_radius").is_some());
     }
 
@@ -1694,7 +1711,10 @@ mod tests {
         let bc = &value["basis_coefficients"];
         assert!(bc.get("v").is_some(), "basis_coefficients missing 'v'");
         assert!(bc.get("dim").is_some(), "basis_coefficients missing 'dim'");
-        assert!(bc.get("data").is_some(), "basis_coefficients missing 'data'");
+        assert!(
+            bc.get("data").is_some(),
+            "basis_coefficients missing 'data'"
+        );
         assert_eq!(bc["v"], 1);
         assert!(bc["dim"].is_array());
         assert!(bc["data"].is_array());
@@ -1710,8 +1730,14 @@ mod tests {
         // Both elements have ndarray object format
         for elem in first_pair.as_array().unwrap() {
             assert!(elem.get("v").is_some(), "basis_arrays element missing 'v'");
-            assert!(elem.get("dim").is_some(), "basis_arrays element missing 'dim'");
-            assert!(elem.get("data").is_some(), "basis_arrays element missing 'data'");
+            assert!(
+                elem.get("dim").is_some(),
+                "basis_arrays element missing 'dim'"
+            );
+            assert!(
+                elem.get("data").is_some(),
+                "basis_arrays element missing 'data'"
+            );
             assert_eq!(elem["v"], 1);
         }
     }

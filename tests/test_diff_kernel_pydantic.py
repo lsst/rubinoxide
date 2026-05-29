@@ -96,9 +96,7 @@ def _build_synthetic_images():
     star_radius = int(np.ceil(4.0 * 1.2))
     offsets = np.arange(-star_radius, star_radius + 1)
     dy, dx = np.meshgrid(offsets, offsets, indexing="ij")
-    profile = np.exp(
-        -(dx ** 2 + dy ** 2) / (2.0 * 1.2 ** 2)
-    ) / (2.0 * np.pi * 1.2 ** 2)
+    profile = np.exp(-(dx**2 + dy**2) / (2.0 * 1.2**2)) / (2.0 * np.pi * 1.2**2)
 
     edge = star_radius
     num_stars = 20
@@ -116,9 +114,7 @@ def _build_synthetic_images():
         prc = x_end - x_start
         yr = y_start - (yc - star_radius)
         xr = x_start - (xc - star_radius)
-        template[y_start:y_end, x_start:x_end] += (
-            amplitudes[i] * profile[yr : yr + pry, xr : xr + prc]
-        )
+        template[y_start:y_end, x_start:x_end] += amplitudes[i] * profile[yr : yr + pry, xr : xr + prc]
 
     # Apply a simple Gaussian PSF change to simulate different telescope
     # conditions between template and science
@@ -129,8 +125,8 @@ def _build_synthetic_images():
     center = ks // 2
     y_off = np.arange(ks, dtype=np.float64) - center
     x_off = np.arange(ks, dtype=np.float64) - center
-    gauss_y = np.exp(-(y_off ** 2) / (2.0 * sigma_y ** 2))
-    gauss_x = np.exp(-(x_off ** 2) / (2.0 * sigma_x ** 2))
+    gauss_y = np.exp(-(y_off**2) / (2.0 * sigma_y**2))
+    gauss_x = np.exp(-(x_off**2) / (2.0 * sigma_x**2))
     kernel_2d = np.outer(gauss_y, gauss_x)
     kernel_2d /= kernel_2d.sum()
     convolved = fftconvolve(template, kernel_2d, mode="same")
@@ -156,29 +152,18 @@ def _build_synthetic_images():
 def _make_kernel():
     """Build a real ``DiffKernel`` (f64) using ``solve_diff_kernel``."""
     template, target_sci, xind, yind = _build_synthetic_images()
-    basis = generate_gauss_hermite_basis(
-        half_width=HALF_WIDTH, widths=WIDTHS, orders=ORDERS
-    )
-    return DiffKernel.solve_diff_kernel(
-        xind, yind, basis, SPATIAL_ORDER, template, target_sci
-    )
+    basis = generate_gauss_hermite_basis(half_width=HALF_WIDTH, widths=WIDTHS, orders=ORDERS)
+    return DiffKernel.solve_diff_kernel(xind, yind, basis, SPATIAL_ORDER, template, target_sci)
 
 
 def _make_kernel_f32():
     """Build a real ``DiffKernel`` with f32 data using ``solve_diff_kernel``."""
     template, target_sci, xind, yind = _build_synthetic_images()
-    basis_f64 = generate_gauss_hermite_basis(
-        half_width=HALF_WIDTH, widths=WIDTHS, orders=ORDERS
-    )
-    basis_f32 = [
-        (yk.astype(np.float32), xk.astype(np.float32))
-        for yk, xk in basis_f64
-    ]
+    basis_f64 = generate_gauss_hermite_basis(half_width=HALF_WIDTH, widths=WIDTHS, orders=ORDERS)
+    basis_f32 = [(yk.astype(np.float32), xk.astype(np.float32)) for yk, xk in basis_f64]
     template_f32 = template.astype(np.float32)
     target_f32 = target_sci.astype(np.float32)
-    return DiffKernel.solve_diff_kernel(
-        xind, yind, basis_f32, SPATIAL_ORDER, template_f32, target_f32
-    )
+    return DiffKernel.solve_diff_kernel(xind, yind, basis_f32, SPATIAL_ORDER, template_f32, target_f32)
 
 
 def _get_dict(kernel):
@@ -187,7 +172,7 @@ def _get_dict(kernel):
 
 
 EXPECTED_DUMP_KEYS = frozenset(
-    {"dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients"}
+    {"dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients", "reduced_chisq"}
 )
 
 
@@ -372,9 +357,7 @@ class DiffKernelPydanticTestCase(TestCase):
     def test_pydantic_core_schema_exists(self):
         """``__get_pydantic_core_schema__`` is a callable class attribute."""
         self.assertTrue(hasattr(DiffKernel, "__get_pydantic_core_schema__"))
-        self.assertTrue(
-            callable(getattr(DiffKernel, "__get_pydantic_core_schema__"))
-        )
+        self.assertTrue(callable(getattr(DiffKernel, "__get_pydantic_core_schema__")))
 
     # ########################################################################
     # Test 10 — __get_pydantic_json_schema__ exists and returns sensible dict
