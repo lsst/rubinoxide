@@ -28,14 +28,15 @@
 #  POSSIBILITY OF SUCH DAMAGE.
 
 """
-Comprehensive comparison tests for the Rust diff kernel (`DiffKernel` and
-`DiffKernelF32`) against a Python reference implementation.
+Comprehensive comparison tests for the Rust diff kernel (DiffKernel f64/f32 variants)
+against a Python reference implementation.
 
 The Python implementations below faithfully reproduce the steps of the Rust
 `solve_diff_kernel` and `apply_kernel` methods so we can assert numerical
 equivalence between the two code paths.
 """
 
+import json
 import unittest
 
 import numpy as np
@@ -50,18 +51,6 @@ from lsst.rubinoxide._rubinoxide import difference_kernel as dk
 
 DiffKernel = dk.DiffKernel
 generate_gauss_hermite_basis = dk.generate_gauss_hermite_basis
-
-# DiffKernelF32 may not be exported in all builds; guard gracefully
-try:
-    DiffKernelF32 = dk.DiffKernelF32
-except AttributeError:
-    DiffKernelF32 = None
-
-# deserialize_diff_kernel may not be exported in all builds; guard gracefully
-try:
-    deserialize_diff_kernel = dk.deserialize_diff_kernel
-except AttributeError:
-    deserialize_diff_kernel = None
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -432,15 +421,13 @@ class DiffKernelConvolveTestCase(TestCase):
         self.assertLess(rms(diff_rust), 2.0 * noise_sigma * np.sqrt(template.size))
 
     def test_apply_kernel_f32_vs_python(self):
-        """Isolated test of ``DiffKernelF32.apply_kernel`` vs Python reference.
+        """Isolated test of ``DiffKernel.apply_kernel`` with float32 inputs.
 
-        Same approach as the f64 test but with float32 inputs.  The Rust f32
-        apply result is compared against a float32-cast of the Python f64
-        apply result (computed with the f64 Rust coefficients, cast to f32).
+        Uses the unified DiffKernel.solve_diff_kernel with f32 numpy arrays;
+        the unified solver auto-detects f32 inputs and creates an f32 kernel
+        internally.  The result is compared against the Python f64 apply
+        reference with relaxed f32 tolerances.
         """
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not exported in current build")
-
         template, target_sci, xind, yind, noise_sigma = self._build_synthetic_images(
             img_size=500, num_stars=70, noise_sigma=1.0, seed=42
         )
@@ -457,14 +444,14 @@ class DiffKernelConvolveTestCase(TestCase):
         ]
         spatial_order = 2
 
-        # --- Rust f32 solver ---
-        rust_kernel = DiffKernelF32.solve_diff_kernel(
+        # --- Unified solver with f32 inputs (auto-creates f32 kernel) ---
+        rust_kernel = DiffKernel.solve_diff_kernel(
             xind, yind, basis_f32, spatial_order, template_f32, target_f32
         )
         rust_coeffs = rust_kernel.get_basis_coefficients()
         R = len(basis_f32[0][0]) // 2
 
-        # --- Rust f32 apply ---
+        # --- Rust apply ---
         rust_applied = rust_kernel.apply_kernel(template_f32)
 
         # --- Python apply **with Rust f32 coefficients, f32 basis and image** ---
@@ -577,13 +564,6 @@ class DiffKernelConvolveTestCase(TestCase):
         out_restored = restored.apply_kernel(test_image)
         np.testing.assert_allclose(out_original, out_restored, rtol=1e-8, atol=1e-10)
 
-        # Test deserialize_diff_kernel dispatch
-        if deserialize_diff_kernel is not None:
-            dispatched = deserialize_diff_kernel(json_str)
-            self.assertIsInstance(dispatched, DiffKernel)
-            dispatched_coeffs = dispatched.get_basis_coefficients()
-            np.testing.assert_allclose(original_coeffs, dispatched_coeffs, rtol=1e-10, atol=1e-12)
-
     def test_json_roundtrip_invalid_json(self):
         """Test that DiffKernel.from_json raises on invalid JSON."""
         with self.assertRaises(ValueError):
@@ -593,46 +573,13 @@ class DiffKernelConvolveTestCase(TestCase):
         with self.assertRaises(ValueError):
             DiffKernel.from_json("[]")
 
-    def test_deserialize_diff_kernel_dispatch_f64(self):
-        """Test that deserialize_diff_kernel correctly dispatches an f64 kernel."""
-        if deserialize_diff_kernel is None:
-            self.skipTest("deserialize_diff_kernel not available in current build")
+    def test_json_roundtrip_f32(self):
+        """Test that DiffKernel json/from_json round-trips correctly for f32 kernels."""
+        import json
 
         np.random.seed(42)
         template, target_sci, xind, yind, _ = self._build_synthetic_images()
 
-        basis = generate_gauss_hermite_basis(half_width=10.0, widths=[1.0, 2.0], orders=[1, 2])
-        spatial_order = 2
-
-        kernel = DiffKernel.solve_diff_kernel(
-            xind, yind, basis, spatial_order, template, target_sci
-        )
-
-        json_str = kernel.json()
-
-        # Dispatch should return a DiffKernel instance
-        restored = deserialize_diff_kernel(json_str)
-        self.assertIsInstance(restored, DiffKernel)
-
-        # Verify coefficients match
-        original_coeffs = kernel.get_basis_coefficients()
-        restored_coeffs = restored.get_basis_coefficients()
-        np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
-
-        # Verify apply_kernel produces same output
-        out_original = kernel.apply_kernel(template.astype(np.float64))
-        out_restored = restored.apply_kernel(template.astype(np.float64))
-        np.testing.assert_allclose(out_original, out_restored, rtol=1e-8, atol=1e-10)
-
-    def test_deserialize_diff_kernel_dispatch_f32(self):
-        """Test that deserialize_diff_kernel correctly dispatches an f32 kernel."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not exported in current build")
-        if deserialize_diff_kernel is None:
-            self.skipTest("deserialize_diff_kernel not available in current build")
-
-        np.random.seed(42)
-        template, target_sci, xind, yind, _ = self._build_synthetic_images()
         template_f32 = template.astype(np.float32)
         target_f32 = target_sci.astype(np.float32)
 
@@ -643,40 +590,51 @@ class DiffKernelConvolveTestCase(TestCase):
         ]
         spatial_order = 2
 
-        kernel = DiffKernelF32.solve_diff_kernel(
+        # Build f32 kernel via unified DiffKernel.solve_diff_kernel with f32 inputs
+        kernel = DiffKernel.solve_diff_kernel(
             xind, yind, basis_f32, spatial_order, template_f32, target_f32
         )
 
+        # Serialize to JSON
         json_str = kernel.json()
+        self.assertIsInstance(json_str, str)
+        self.assertGreater(len(json_str), 0)
 
-        # Dispatch should return a DiffKernelF32 instance
-        restored = deserialize_diff_kernel(json_str)
-        self.assertIsInstance(restored, DiffKernelF32)
+        # Verify JSON contains the f32 dtype field
+        parsed = json.loads(json_str)
+        self.assertEqual(parsed.get("dtype"), "DiffKernelF32")
 
-        # Verify apply_kernel produces same output (f32 tolerance)
+        # Deserialize back
+        restored = DiffKernel.from_json(json_str)
+        self.assertIsInstance(restored, DiffKernel)
+
+        # Verify coefficients match (f32 tolerance)
+        original_coeffs = kernel.get_basis_coefficients()
+        restored_coeffs = restored.get_basis_coefficients()
+        np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-5, atol=1e-6)
+
+        # Verify apply_kernel produces same output on a test image
         out_original = kernel.apply_kernel(template_f32)
         out_restored = restored.apply_kernel(template_f32)
         np.testing.assert_allclose(out_original, out_restored, rtol=1e-4, atol=1e-4)
 
-    def test_deserialize_diff_kernel_invalid(self):
-        """Test that deserialize_diff_kernel raises on invalid input."""
-        if deserialize_diff_kernel is None:
-            self.skipTest("deserialize_diff_kernel not available in current build")
+    def test_apply_kernel_f32_dtype_mismatch(self):
+        """Test that applying an f64 kernel to an f32 image raises TypeError."""
+        np.random.seed(42)
+        template, target_sci, xind, yind, _ = self._build_synthetic_images()
 
-        # Invalid JSON
-        with self.assertRaises(ValueError):
-            deserialize_diff_kernel("not valid json")
+        basis = generate_gauss_hermite_basis(half_width=10.0, widths=[1.0, 2.0], orders=[1, 2])
+        spatial_order = 2
 
-        # Missing dtype field (legacy format not supported by dispatcher)
-        with self.assertRaises(ValueError):
-            deserialize_diff_kernel("{}")
+        # Build an f64 kernel
+        kernel = DiffKernel.solve_diff_kernel(
+            xind, yind, basis, spatial_order, template, target_sci
+        )
 
-        # Wrong dtype value
-        with self.assertRaises(ValueError):
-            import json as _json
-            bad = {"dtype": "DiffKernelF16", "basis_arrays": [], "basis_radius": 0,
-                   "spatial_order": 0, "basis_coefficients": []}
-            deserialize_diff_kernel(_json.dumps(bad))
+        # Attempt to apply the f64 kernel with an f32 image should raise TypeError
+        template_f32 = template.astype(np.float32)
+        with self.assertRaises(TypeError):
+            kernel.apply_kernel(template_f32)
 
 
 # ---------------------------------------------------------------------------

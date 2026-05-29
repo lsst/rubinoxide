@@ -28,10 +28,10 @@
 #  POSSIBILITY OF SUCH DAMAGE.
 
 """
-Tests for the Pydantic v2 integration methods on ``DiffKernel`` and
-``DiffKernelF32``.
+Tests for the Pydantic v2 integration methods on ``DiffKernel``.
 
-The following methods are exercised:
+The unified ``DiffKernel`` class supports both f64 and f32 data.  The
+following methods are exercised:
 
   - ``__get_pydantic_core_schema__``
   - ``__get_pydantic_json_schema__``
@@ -43,6 +43,7 @@ Pydantic-specific integration tests (embedding DiffKernel inside a Pydantic
 """
 
 import json
+import jsonschema
 import unittest
 
 import numpy as np
@@ -56,11 +57,6 @@ from lsst.rubinoxide._rubinoxide import difference_kernel as dk
 
 DiffKernel = dk.DiffKernel
 generate_gauss_hermite_basis = dk.generate_gauss_hermite_basis
-
-try:
-    DiffKernelF32 = dk.DiffKernelF32
-except AttributeError:
-    DiffKernelF32 = None
 
 # ---------------------------------------------------------------------------
 # Optional pydantic import — tests skip cleanly if absent
@@ -169,9 +165,7 @@ def _make_kernel():
 
 
 def _make_kernel_f32():
-    """Build a real ``DiffKernelF32`` (f32) using ``solve_diff_kernel``."""
-    if DiffKernelF32 is None:
-        raise unittest.SkipTest("DiffKernelF32 not available in this build")
+    """Build a real ``DiffKernel`` with f32 data using ``solve_diff_kernel``."""
     template, target_sci, xind, yind = _build_synthetic_images()
     basis_f64 = generate_gauss_hermite_basis(
         half_width=HALF_WIDTH, widths=WIDTHS, orders=ORDERS
@@ -182,7 +176,7 @@ def _make_kernel_f32():
     ]
     template_f32 = template.astype(np.float32)
     target_f32 = target_sci.astype(np.float32)
-    return DiffKernelF32.solve_diff_kernel(
+    return DiffKernel.solve_diff_kernel(
         xind, yind, basis_f32, SPATIAL_ORDER, template_f32, target_f32
     )
 
@@ -203,8 +197,9 @@ EXPECTED_DUMP_KEYS = frozenset(
 
 
 class DiffKernelPydanticTestCase(TestCase):
-    """Exhaustive tests for Pydantic v2 integration on DiffKernel and
-    DiffKernelF32.
+    """Exhaustive tests for Pydantic v2 integration on DiffKernel.
+
+    Includes both f64 and f32 variants exercising the unified class.
     """
 
     # ########################################################################
@@ -227,12 +222,10 @@ class DiffKernelPydanticTestCase(TestCase):
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
 
     def test_model_validate_from_instance_f32(self):
-        """DiffKernelF32 variant of test 1."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel model_validate from an f32 instance."""
         kernel = _make_kernel_f32()
-        result = DiffKernelF32.model_validate(kernel)
-        self.assertIsInstance(result, DiffKernelF32)
+        result = DiffKernel.model_validate(kernel)
+        self.assertIsInstance(result, DiffKernel)
         self.assertIsNot(result, kernel)
         original_coeffs = kernel.get_basis_coefficients()
         restored_coeffs = result.get_basis_coefficients()
@@ -253,13 +246,11 @@ class DiffKernelPydanticTestCase(TestCase):
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
 
     def test_model_validate_from_dict_f32(self):
-        """DiffKernelF32 dict variant of test 2."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel model_validate from an f32 dict."""
         kernel = _make_kernel_f32()
         kernel_dict = _get_dict(kernel)
-        restored = DiffKernelF32.model_validate(kernel_dict)
-        self.assertIsInstance(restored, DiffKernelF32)
+        restored = DiffKernel.model_validate(kernel_dict)
+        self.assertIsInstance(restored, DiffKernel)
         original_coeffs = kernel.get_basis_coefficients()
         restored_coeffs = restored.get_basis_coefficients()
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-5, atol=1e-7)
@@ -279,13 +270,11 @@ class DiffKernelPydanticTestCase(TestCase):
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
 
     def test_model_validate_from_json_string_f32(self):
-        """DiffKernelF32 JSON-string variant of test 3."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel model_validate from an f32 JSON string."""
         kernel = _make_kernel_f32()
         json_str = kernel.json()
-        restored = DiffKernelF32.model_validate(json_str)
-        self.assertIsInstance(restored, DiffKernelF32)
+        restored = DiffKernel.model_validate(json_str)
+        self.assertIsInstance(restored, DiffKernel)
         original_coeffs = kernel.get_basis_coefficients()
         restored_coeffs = restored.get_basis_coefficients()
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-5, atol=1e-7)
@@ -300,14 +289,6 @@ class DiffKernelPydanticTestCase(TestCase):
             with self.assertRaises(TypeError):
                 DiffKernel.model_validate(bad_value)
 
-    def test_model_validate_invalid_type_f32(self):
-        """DiffKernelF32 invalid-type variant of test 4."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
-        for bad_value in [[1, 2, 3], 42, None]:
-            with self.assertRaises(TypeError):
-                DiffKernelF32.model_validate(bad_value)
-
     # ########################################################################
     # Test 5 — model_validate invalid JSON string
     # ########################################################################
@@ -316,13 +297,6 @@ class DiffKernelPydanticTestCase(TestCase):
         """``model_validate("not json")`` raises ``ValueError``."""
         with self.assertRaises(ValueError):
             DiffKernel.model_validate("not json")
-
-    def test_model_validate_invalid_json_string_f32(self):
-        """DiffKernelF32 invalid-JSON-string variant of test 5."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
-        with self.assertRaises(ValueError):
-            DiffKernelF32.model_validate("not json")
 
     # ########################################################################
     # Test 6 — model_dump returns dict with expected keys
@@ -344,9 +318,7 @@ class DiffKernelPydanticTestCase(TestCase):
         self.assertIsInstance(dumped["spatial_order"], int)
 
     def test_model_dump_returns_dict_f32(self):
-        """DiffKernelF32 model_dump variant of test 6."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel model_dump from an f32 kernel preserves dtype."""
         kernel = _make_kernel_f32()
         dumped = kernel.model_dump()
         self.assertIsInstance(dumped, dict)
@@ -367,12 +339,10 @@ class DiffKernelPydanticTestCase(TestCase):
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-10, atol=1e-12)
 
     def test_model_dump_round_trip_f32(self):
-        """DiffKernelF32 round-trip variant of test 7."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel f32 round-trip via model_dump/model_validate."""
         kernel = _make_kernel_f32()
         dumped = kernel.model_dump()
-        restored = DiffKernelF32.model_validate(dumped)
+        restored = DiffKernel.model_validate(dumped)
         original_coeffs = kernel.get_basis_coefficients()
         restored_coeffs = restored.get_basis_coefficients()
         np.testing.assert_allclose(original_coeffs, restored_coeffs, rtol=1e-5, atol=1e-7)
@@ -389,9 +359,7 @@ class DiffKernelPydanticTestCase(TestCase):
         self.assertEqual(json_dict, dumped)
 
     def test_model_dump_json_matches_f32(self):
-        """DiffKernelF32 json-match variant of test 8."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+        """Unified DiffKernel f32: model_dump() matches json().loads()."""
         kernel = _make_kernel_f32()
         dumped = kernel.model_dump()
         json_dict = json.loads(kernel.json())
@@ -406,15 +374,6 @@ class DiffKernelPydanticTestCase(TestCase):
         self.assertTrue(hasattr(DiffKernel, "__get_pydantic_core_schema__"))
         self.assertTrue(
             callable(getattr(DiffKernel, "__get_pydantic_core_schema__"))
-        )
-
-    def test_pydantic_core_schema_exists_f32(self):
-        """DiffKernelF32 variant of test 9."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
-        self.assertTrue(hasattr(DiffKernelF32, "__get_pydantic_core_schema__"))
-        self.assertTrue(
-            callable(getattr(DiffKernelF32, "__get_pydantic_core_schema__"))
         )
 
     # ########################################################################
@@ -435,15 +394,17 @@ class DiffKernelPydanticTestCase(TestCase):
         self.assertIn("basis_radius", props)
         self.assertIn("spatial_order", props)
 
-    def test_pydantic_json_schema_exists_f32(self):
-        """DiffKernelF32 variant of test 10."""
-        if DiffKernelF32 is None:
-            self.skipTest("DiffKernelF32 not available")
+    # ########################################################################
+    # Test 10.1 — JSON schema validates real serialized output
+    # ########################################################################
+
+    def test_json_schema_validates_real_output(self):
+        """Serialized kernel dict validates against the Pydantic JSON Schema."""
+        kernel = _make_kernel()
+        kernel_dict = json.loads(kernel.json())
         handler = lambda schema, _outer_handler: {}  # noqa: E731
-        result = DiffKernelF32.__get_pydantic_json_schema__({}, handler)
-        self.assertIsInstance(result, dict)
-        self.assertEqual(result.get("type"), "object")
-        self.assertIn("properties", result)
+        schema = DiffKernel.__get_pydantic_json_schema__({}, handler)
+        jsonschema.validate(kernel_dict, schema)
 
     # ########################################################################
     # Tests 11–15 — Full Pydantic BaseModel integration (require pydantic)

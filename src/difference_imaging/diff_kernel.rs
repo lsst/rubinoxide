@@ -34,10 +34,10 @@ use std::ptr;
 use ndarray::NdFloat;
 use ndarray::{prelude::*, Zip};
 use ndarray::{Array1, Array2};
-use num_traits::{NumCast, One};
+use num_traits::NumCast;
 use numpy::Element;
-use ndarray_linalg::Solve;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use ndarray_linalg::{Scalar, Solve};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use serde::{Serialize, Deserialize};
 
@@ -228,488 +228,681 @@ fn convolve_at_one_point<T: NdFloat + Default>(
     *prev_x = *x;
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[pyclass(name = "DiffKernel")]
-pub struct DiffKernelF64 {
-    basis_arrays: Vec<(Array1<f64>, Array1<f64>)>,
-    basis_radius: usize,
-    spatial_order: u32,
-    basis_coefficients: Array1<f64>,
+// ---------------------------------------------------------------------------
+// Inner data structures — plain Rust, no #[pyclass]
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiffKernelData<T: NdFloat + Default + NumCast> {
+    pub basis_arrays: Vec<(Array1<T>, Array1<T>)>,
+    pub basis_radius: usize,
+    pub spatial_order: u32,
+    pub basis_coefficients: Array1<T>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[pyclass(name = "DiffKernelF32")]
-pub struct DiffKernelF32 {
-    basis_arrays: Vec<(Array1<f32>, Array1<f32>)>,
-    basis_radius: usize,
-    spatial_order: u32,
-    basis_coefficients: Array1<f32>,
+// ---------------------------------------------------------------------------
+// Tagged union enum — uses #[serde(tag = "dtype")] for internal tagging
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "dtype")]
+pub enum DiffKernelInner {
+    #[serde(rename = "DiffKernel")]
+    F64(DiffKernelData<f64>),
+    #[serde(rename = "DiffKernelF32")]
+    F32(DiffKernelData<f32>),
 }
 
-/// Serialization wrapper that adds a "dtype" tag to identify f64 vs f32 kernels.
-#[derive(Serialize, Deserialize)]
-struct TypedDiffKernelF64 {
-    #[serde(rename = "dtype")]
-    dtype_value: String,
-    #[serde(flatten)]
-    data: DiffKernelF64,
-}
+// ---------------------------------------------------------------------------
+// Pure-Rust methods on DiffKernelData (generic impl)
+// ---------------------------------------------------------------------------
 
-/// Serialization wrapper that adds a "dtype" tag to identify f64 vs f32 kernels.
-#[derive(Serialize, Deserialize)]
-struct TypedDiffKernelF32 {
-    #[serde(rename = "dtype")]
-    dtype_value: String,
-    #[serde(flatten)]
-    data: DiffKernelF32,
-}
+impl<T> DiffKernelData<T>
+where
+    T: NdFloat + Default + NumCast,
+{
+    fn _draw_unweighted_basis(&self, index: usize) -> Array2<T> {
+        let basis_len = self.basis_radius * 2 + 1;
+        let y_column = self.basis_arrays[index].0.to_shape((basis_len, 1)).unwrap();
+        let x_row = self.basis_arrays[index].1.to_shape((1, basis_len)).unwrap();
 
-// Macro to generate the pure-Rust impl block for both DiffKernelF64 and DiffKernelF32
-macro_rules! impl_diff_kernel_methods {
-    ($struct_name:ident, $T:ty) => {
-        impl $struct_name {
-            fn _draw_unweighted_basis(&self, index: usize) -> Array2<$T> {
-                let basis_len = self.basis_radius * 2 + 1;
-                let y_column = self.basis_arrays[index].0.to_shape((basis_len, 1)).unwrap();
-                let x_row = self.basis_arrays[index].1.to_shape((1, basis_len)).unwrap();
+        y_column.dot(&x_row)
+    }
 
-                y_column.dot(&x_row)
+    fn _draw_weighted_basis(&self, index: usize, y_pos: T, x_pos: T) -> Array2<T> {
+        let spatial_order = self.spatial_order as usize + 1;
+        let basis_len = self.basis_radius * 2 + 1;
+
+        let spatial_size = (spatial_order * (spatial_order + 1) / 2) as usize;
+
+        let mut spatial_terms = Array1::<T>::zeros(spatial_size);
+        let cheb_size = if self.spatial_order < 1 {
+            1
+        } else {
+            self.spatial_order
+        };
+
+        let mut y_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+        let mut x_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+        self._populate_spatial_terms(
+            y_pos,
+            x_pos,
+            &mut spatial_terms.view_mut(),
+            &mut y_cheb.view_mut(),
+            &mut x_cheb.view_mut(),
+        );
+
+        // get indexes into the component parts
+        let basis_index = index / spatial_size;
+        let spatial_index = index % spatial_size;
+
+        let weight = self.basis_coefficients[index];
+        let spatial_weight = spatial_terms[spatial_index];
+
+        let y_column = self.basis_arrays[basis_index]
+            .0
+            .to_shape((basis_len, 1))
+            .unwrap();
+        let x_row = self.basis_arrays[basis_index]
+            .1
+            .to_shape((1, basis_len))
+            .unwrap();
+
+        y_column.dot(&x_row) * weight * spatial_weight
+    }
+
+    fn _populate_spatial_terms(
+        &self,
+        y_pos: T,
+        x_pos: T,
+        spatial_terms: &mut ArrayViewMut1<T>,
+        y_cheb: &mut ArrayViewMut1<T>,
+        x_cheb: &mut ArrayViewMut1<T>,
+    ) {
+        y_cheb[0] = <T>::one();
+        x_cheb[0] = <T>::one();
+        y_cheb[1] = y_pos;
+        x_cheb[1] = x_pos;
+
+        for i in 2..self.spatial_order + 1 {
+            let i = i as usize;
+            y_cheb[i] = <T as NumCast>::from(2).unwrap() * y_pos * y_cheb[i - 1] - y_cheb[i - 2];
+            x_cheb[i] = <T as NumCast>::from(2).unwrap() * x_pos * x_cheb[i - 1] - x_cheb[i - 2];
+        }
+
+        let mut index: usize = 0;
+        for i in 0..(self.spatial_order as usize + 1) {
+            for j in 0..(self.spatial_order as usize - i + 1) {
+                spatial_terms[index] = x_cheb[i] * y_cheb[j];
+                index += 1;
             }
+        }
+    }
 
-            fn _draw_weighted_basis(&self, index: usize, y_pos: $T, x_pos: $T) -> Array2<$T> {
-                let spatial_order = self.spatial_order as usize + 1;
-                let basis_len = self.basis_radius * 2 + 1;
+    fn apply_kernel(&self, input_array: ArrayView2<T>) -> Array2<T> {
+        let input_shape = input_array.dim();
+        let output_shape = (
+            input_shape.0 - 2 * self.basis_radius,
+            input_shape.1 - 2 * self.basis_radius,
+        );
+        let x_mid = input_shape.1 / 2;
+        let y_mid = input_shape.0 / 2;
 
-                let spatial_size = (spatial_order * (spatial_order + 1) / 2) as usize;
+        let cheb_size = if self.spatial_order < 1 {
+            1
+        } else {
+            self.spatial_order
+        };
 
-                let mut spatial_terms = Array1::<$T>::zeros(spatial_size);
-                let cheb_size = if self.spatial_order < 1 {
-                    1
-                } else {
-                    self.spatial_order
-                };
+        let mut y_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+        y_cheb[0] = <T>::one();
+        let mut x_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+        x_cheb[0] = <T>::one();
 
-                let mut y_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
-                let mut x_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
+        let mut output_array = Array2::<T>::zeros(output_shape);
+
+        let order = self.spatial_order as usize;
+        let size = (order + 1) * (order + 2) / 2;
+        let mut spatial_terms_filtered = Array1::<T>::zeros(size);
+
+        let basis_len = self.basis_arrays.len();
+        let kernel_size = 2 * self.basis_radius + 1;
+        let mut basis_values = Array1::<T>::zeros(basis_len);
+        let mut basis_y_cache = ConvolveCache::new(kernel_size, basis_len);
+        let mut prev_y = i32::MAX;
+        let mut prev_x = i32::MAX;
+
+        let basis_views = self
+            .basis_arrays
+            .iter()
+            .map(|(y, x)| (y.view(), x.view()))
+            .collect::<Vec<(ArrayView1<T>, ArrayView1<T>)>>();
+
+        for y_pos in self.basis_radius..input_shape.0 - self.basis_radius {
+            for x_pos in self.basis_radius..input_shape.1 - self.basis_radius {
+                let poly_y_pos =
+                    (<T as NumCast>::from(y_pos).unwrap() - <T as NumCast>::from(y_mid).unwrap())
+                        / <T as NumCast>::from(y_mid).unwrap();
+                let poly_x_pos =
+                    (<T as NumCast>::from(x_pos).unwrap() - <T as NumCast>::from(x_mid).unwrap())
+                        / <T as NumCast>::from(x_mid).unwrap();
+
                 self._populate_spatial_terms(
-                    y_pos,
-                    x_pos,
-                    &mut spatial_terms.view_mut(),
+                    poly_y_pos,
+                    poly_x_pos,
+                    &mut spatial_terms_filtered.view_mut(),
                     &mut y_cheb.view_mut(),
                     &mut x_cheb.view_mut(),
                 );
+                convolve_at_one_point(
+                    &(x_pos as i32),
+                    &(y_pos as i32),
+                    &mut prev_x,
+                    &mut prev_y,
+                    self.basis_radius as i32,
+                    basis_len,
+                    &mut basis_values,
+                    &basis_views,
+                    &mut basis_y_cache,
+                    &input_array,
+                );
 
-                // get indexes into the component parts
-                let basis_index = index / spatial_size;
-                let spatial_index = index % spatial_size;
+                let mut accu: T = T::default();
 
-                let weight = self.basis_coefficients[index];
-                let spatial_weight = spatial_terms[spatial_index];
-
-                let y_column = self.basis_arrays[basis_index]
-                    .0
-                    .to_shape((basis_len, 1))
-                    .unwrap();
-                let x_row = self.basis_arrays[basis_index]
-                    .1
-                    .to_shape((1, basis_len))
-                    .unwrap();
-
-                y_column.dot(&x_row) * weight * spatial_weight
-            }
-
-            fn _populate_spatial_terms(
-                &self,
-                y_pos: $T,
-                x_pos: $T,
-                spatial_terms: &mut ArrayViewMut1<$T>,
-                y_cheb: &mut ArrayViewMut1<$T>,
-                x_cheb: &mut ArrayViewMut1<$T>,
-            ) {
-                y_cheb[0] = <$T>::one();
-                x_cheb[0] = <$T>::one();
-                y_cheb[1] = y_pos;
-                x_cheb[1] = x_pos;
-
-                for i in 2..self.spatial_order + 1 {
-                    let i = i as usize;
-                    y_cheb[i] = <$T as NumCast>::from(2).unwrap() * y_pos * y_cheb[i - 1] - y_cheb[i - 2];
-                    x_cheb[i] = <$T as NumCast>::from(2).unwrap() * x_pos * x_cheb[i - 1] - x_cheb[i - 2];
+                unsafe {
+                    let mut coeff_ptr = self.basis_coefficients.as_ptr();
+                    for basis_value in &basis_values {
+                        for sp_term in &spatial_terms_filtered {
+                            accu += *basis_value * *sp_term * *coeff_ptr;
+                            coeff_ptr = coeff_ptr.add(1);
+                        }
+                    }
                 }
 
-                let mut index: usize = 0;
-                for i in 0..(self.spatial_order as usize + 1) {
-                    for j in 0..(self.spatial_order as usize - i + 1) {
-                        spatial_terms[index] = x_cheb[i] * y_cheb[j];
-                        index += 1;
-                    }
+                unsafe {
+                    *output_array.uget_mut([
+                        y_pos - self.basis_radius,
+                        x_pos - self.basis_radius,
+                    ]) = accu;
                 }
             }
         }
-    };
+
+        output_array
+    }
 }
 
-impl_diff_kernel_methods!(DiffKernelF64, f64);
-impl_diff_kernel_methods!(DiffKernelF32, f32);
+// ---------------------------------------------------------------------------
+// Generic solve_diff_kernel (pure Rust, no Python types)
+// ---------------------------------------------------------------------------
 
-// Macro to generate #[pymethods] blocks for both DiffKernelF64 and DiffKernelF32.
-// Method names are not suffixed — the type name (DiffKernel vs DiffKernelF32)
-// already disambiguates.
-//
-// Invocation:
-//   impl_diff_kernel_pymethods!(DiffKernelF64, f64, TypedDiffKernelF64, "DiffKernel");
-//   impl_diff_kernel_pymethods!(DiffKernelF32, f32, TypedDiffKernelF32, "DiffKernelF32");
-macro_rules! impl_diff_kernel_pymethods {
-    ($struct_name:ident, $T:ty, $wrapped_type:ident, $type_tag:expr) => {
-        #[pymethods]
-        impl $struct_name {
-            /// Return the basis coefficients array fitted during ``solve_diff_kernel``.
-            ///
-            /// Returns the 1-D array of learned kernel coefficients that weight each
-            /// basis function expanded over the spatial Chebyshev polynomial grid.
-            ///
-            /// Returns
-            /// -------
-            /// ``numpy.ndarray`` of float
-            ///     1-D array of basis coefficients. The dtype matches the kernel type
-            ///     (``float64`` for ``DiffKernel``, ``float32`` for ``DiffKernelF32``).
-            ///
-            /// Examples
-            /// --------
-            /// >>> coeffs = kernel.get_basis_coefficients()
-            /// >>> print(coeffs.shape)
-            /// (6,)
-            fn get_basis_coefficients<'py>(
-                &self,
-                py: Python<'py>,
-            ) -> Bound<'py, PyArray1<$T>> {
-                self.basis_coefficients.to_owned().into_pyarray(py)
+fn solve_diff_kernel_impl<T>(
+    x_values: ArrayView1<i32>,
+    y_values: ArrayView1<i32>,
+    basis_functions: Vec<(ArrayView1<T>, ArrayView1<T>)>,
+    spatial_order: u32,
+    template_image: ArrayView2<T>,
+    target_image: ArrayView2<T>,
+) -> DiffKernelData<T>
+where
+    T: NdFloat + Default + NumCast + Clone + Scalar,
+    Array2<T>: ndarray_linalg::Solve<T>,
+{
+    let template_shape = template_image.dim();
+
+    let kernel_radius = (&basis_functions[0].0.dim() / 2) as i32;
+
+    let x_mid = template_shape.1 / 2;
+    let y_mid = template_shape.0 / 2;
+
+    let cheb_size = if spatial_order < 1 { 1 } else { spatial_order };
+
+    let mut y_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+    y_cheb[0] = <T>::one();
+    let mut x_cheb = Array1::<T>::zeros((cheb_size + 1) as usize);
+    x_cheb[0] = <T>::one();
+
+    let xy_positions: Vec<(&i32, &i32)> = x_values
+        .iter()
+        .zip(y_values.iter())
+        .filter(|(x, y)| {
+            **x > kernel_radius
+                && **x < (template_shape.1 as i32 - (kernel_radius + 2))
+                && **y > kernel_radius
+                && **y < (template_shape.0 as i32 - (kernel_radius + 2))
+        })
+        .collect();
+
+    let order = (spatial_order) as usize;
+    let size = (order + 1) * (order + 2) / 2;
+    let basis_len = basis_functions.len();
+    let num_parameters = size * basis_len;
+
+    let mut basis_accumulator = Array2::<T>::zeros((num_parameters, num_parameters));
+    let mut basis_accumulator_vec =
+        Array1::<T>::zeros(num_parameters * (num_parameters + 1) / 2);
+    let mut target_accumulator = Array1::<T>::zeros(num_parameters);
+
+    let mut spatial_terms_filtered = Array1::<T>::zeros(size);
+    let x_len = basis_functions[0].0.dim();
+    let mut basis_values = Array1::<T>::zeros(basis_len);
+    let mut basis_y_cache = ConvolveCache::new(x_len, basis_len);
+
+    let mut prev_y = i32::MAX;
+    let mut prev_x = i32::MAX;
+
+    let mut terms = Array1::<T>::zeros(num_parameters);
+    let terms_len = num_parameters;
+
+    for (x, y) in &xy_positions {
+        convolve_at_one_point(
+            x,
+            y,
+            &mut prev_x,
+            &mut prev_y,
+            kernel_radius,
+            basis_len,
+            &mut basis_values,
+            &basis_functions.iter().map(|(y, x)| (y.view(), x.view())).collect(),
+            &mut basis_y_cache,
+            &template_image,
+        );
+
+        let poly_y_pos = (<T as NumCast>::from(**y).unwrap() - <T as NumCast>::from(y_mid).unwrap())
+            / <T as NumCast>::from(y_mid).unwrap();
+        let poly_x_pos = (<T as NumCast>::from(**x).unwrap() - <T as NumCast>::from(x_mid).unwrap())
+            / <T as NumCast>::from(x_mid).unwrap();
+
+        y_cheb[1] = poly_y_pos;
+        x_cheb[1] = poly_x_pos;
+        for i in 2..spatial_order + 1 {
+            let i = i as usize;
+            y_cheb[i] =
+                <T as NumCast>::from(2).unwrap() * poly_y_pos * y_cheb[i - 1]
+                    - y_cheb[i - 2];
+            x_cheb[i] =
+                <T as NumCast>::from(2).unwrap() * poly_x_pos * x_cheb[i - 1]
+                    - x_cheb[i - 2];
+        }
+
+        let mut index: usize = 0;
+        for i in 0..(order + 1) {
+            for j in 0..(order - i + 1) {
+                spatial_terms_filtered[index] = x_cheb[i] * y_cheb[j];
+                index += 1;
             }
+        }
 
-            /// Apply the learned difference kernel to an input image.
-            ///
-            /// Convolves ``input_image`` with the spatially-varying difference kernel
-            /// using the basis functions and coefficients learned by
-            /// ``solve_diff_kernel``. The kernel position is normalized relative
-            /// to the image center using Chebyshev polynomials.
-            ///
-            /// Parameters
-            /// ----------
-            /// input_image : ``numpy.ndarray``
-            ///     2-D input image to process. The dtype must match the kernel type
-            ///     (``float64`` for ``DiffKernel``, ``float32`` for ``DiffKernelF32``).
-            ///
-            /// Returns
-            /// -------
-            /// ``numpy.ndarray``
-            ///     2-D convolved output array. Its shape is shrunk by
-            ///     ``2 * basis_radius`` in each dimension compared to ``input_image``,
-            ///     i.e. ``(H - 2*R, W - 2*R)`` where ``R`` is the basis radius.
-            ///
-            /// Examples
-            /// --------
-            /// >>> from rubinoxide import DiffKernel
-            /// >>> kernel = DiffKernel.solve_diff_kernel(...)
-            /// >>> result = kernel.apply_kernel(science_image)
-            /// >>> print(result.shape)
-            /// (3960, 3960)
-            ///
-            /// Raises
-            /// ------
-            /// ValueError
-            ///     If *input_image* is smaller than ``2 * basis_radius`` in either
-            ///     dimension (would cause integer underflow in output shape
-            ///     computation).
-            fn apply_kernel<'py>(
-                &self,
-                py: Python<'py>,
-                input_image: PyReadonlyArray2<$T>,
-            ) -> Bound<'py, PyArray2<$T>> {
-                let input_array = input_image.as_array();
-                let input_shape = input_array.dim();
-                let output_shape = (
-                    input_shape.0 - 2 * self.basis_radius,
-                    input_shape.1 - 2 * self.basis_radius,
-                );
-                // setup chebichev polynomial stuff
-                let x_mid = input_shape.1 / 2;
-                let y_mid = input_shape.0 / 2;
+        unsafe {
+            let bv_ptr = basis_values.as_ptr();
+            let sp_term_filt_ptr = spatial_terms_filtered.as_ptr();
+            let terms_ptr = terms.as_mut_ptr();
 
-                let cheb_size = if self.spatial_order < 1 {
-                    1
-                } else {
-                    self.spatial_order
-                };
-
-                let mut y_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
-                y_cheb[0] = <$T>::one();
-                let mut x_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
-                x_cheb[0] = <$T>::one();
-
-                let mut output_array = Array2::<$T>::zeros(output_shape);
-
-                let order = self.spatial_order as usize;
-                let size = (order + 1) * (order + 2) / 2;
-                let mut spatial_terms_filtered = Array1::<$T>::zeros(size);
-
-                // setup variables used in convolution
-                let basis_len = self.basis_arrays.len();
-                let kernel_size = 2 * self.basis_radius + 1;
-                let mut basis_values = Array1::<$T>::zeros(basis_len);
-                let mut basis_y_cache = ConvolveCache::new(kernel_size, basis_len);
-                let mut prev_y = i32::MAX;
-                let mut prev_x = i32::MAX;
-
-                let basis_views = self
-                    .basis_arrays
-                    .iter()
-                    .map(|(y, x)| (y.view(), x.view()))
-                    .collect::<Vec<(ArrayView1<$T>, ArrayView1<$T>)>>();
-
-                // loop over the array, calculating all the outputs
-                for y_pos in self.basis_radius..input_shape.0 - self.basis_radius {
-                    for x_pos in self.basis_radius..input_shape.1 - self.basis_radius {
-                        // calculate the cheb poly
-                        let poly_y_pos =
-                            (<$T as NumCast>::from(y_pos).unwrap()
-                                - <$T as NumCast>::from(y_mid).unwrap())
-                                / <$T as NumCast>::from(y_mid).unwrap();
-                        let poly_x_pos =
-                            (<$T as NumCast>::from(x_pos).unwrap()
-                                - <$T as NumCast>::from(x_mid).unwrap())
-                                / <$T as NumCast>::from(x_mid).unwrap();
-                        self._populate_spatial_terms(
-                            poly_y_pos,
-                            poly_x_pos,
-                            &mut (spatial_terms_filtered.view_mut()),
-                            &mut y_cheb.view_mut(),
-                            &mut x_cheb.view_mut(),
-                        );
-                        convolve_at_one_point(
-                            &(x_pos as i32),
-                            &(y_pos as i32),
-                            &mut prev_x,
-                            &mut prev_y,
-                            self.basis_radius as i32,
-                            basis_len,
-                            &mut basis_values,
-                            &basis_views,
-                            &mut basis_y_cache,
-                            &input_array,
-                        );
-
-                        let mut accu: $T = <$T>::default();
-
-                        unsafe {
-                            let mut coeff_ptr = self.basis_coefficients.as_ptr();
-                            for basis_value in &basis_values {
-                                for sp_term in &spatial_terms_filtered {
-                                    accu += *basis_value * *sp_term * *coeff_ptr;
-                                    coeff_ptr = coeff_ptr.add(1);
-     
-                                }
-                            }
-                        }
-
-                        unsafe {
-                            *output_array.uget_mut([
-                                y_pos - self.basis_radius,
-                                x_pos - self.basis_radius,
-                            ]) = accu;
-                        }
-                    }
+            let mut terms_offset = 0usize;
+            for bas in 0..basis_len {
+                let bv_val = *bv_ptr.add(bas);
+                let terms_sub_ptr = terms_ptr.add(terms_offset);
+                for sp in 0..size {
+                    *terms_sub_ptr.add(sp) = bv_val * *sp_term_filt_ptr.add(sp);
                 }
-
-                output_array.into_pyarray(py)
+                terms_offset += size;
             }
+        }
 
-            /// Return a single basis function (without spatial weighting or learned coefficients).
-            ///
-            /// Returns the 2-D outer product of the y- and x-components of the
-            /// basis function at the given index, with no multiplication by the
-            /// learned coefficient or any spatial Chebyshev weighting.
-            ///
-            /// Parameters
-            /// ----------
-            /// index : int
-            ///     Index of the basis function to draw (0-based).
-            ///
-            /// Returns
-            /// -------
-            /// ``numpy.ndarray``
-            ///     2-D array of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
-            ///
-            /// Raises
-            /// ------
-            /// IndexError
-            ///     If *index* is out of range for the stored basis functions.
-            fn draw_unweighted_basis<'py>(
-                &self,
-                py: Python<'py>,
-                index: usize,
-            ) -> Bound<'py, PyArray2<$T>> {
-                self._draw_unweighted_basis(index).into_pyarray(py)
-            }
+        unsafe {
+            let n = terms_len;
+            let basis_ptr_nn =
+                ptr::NonNull::new_unchecked(basis_accumulator_vec.as_mut_ptr());
+            let terms_ptr_nn = ptr::NonNull::new_unchecked(terms.as_mut_ptr());
+            let basis_ptr = basis_ptr_nn.as_ptr();
+            let terms_ptr = terms_ptr_nn.as_ptr();
 
-            /// Return a single basis function weighted by spatial position and learned coefficients.
-            ///
-            /// Returns the 2-D outer product of the y- and x-components of the
-            /// basis function at the given index, scaled by the corresponding
-            /// learned coefficient and the spatial Chebyshev polynomial term
-            /// evaluated at ``(y_pos, x_pos)``.
-            ///
-            /// Parameters
-            /// ----------
-            /// index : int
-            ///     Index of the weighted basis function to draw (0-based).
-            /// y_pos : float
-            ///     Y position (normalized pixel coordinate) for spatial weighting.
-            ///     Should be in ``[-1, +1]`` relative to image center for correct
-            ///     Chebyshev polynomial evaluation.
-            /// x_pos : float
-            ///     X position (normalized pixel coordinate) for spatial weighting.
-            ///     Should be in ``[-1, +1]`` relative to image center for correct
-            ///     Chebyshev polynomial evaluation.
-            ///
-            /// Returns
-            /// -------
-            /// ``numpy.ndarray``
-            ///     2-D weighted basis function array of shape
-            ///     ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
-            ///
-            /// Raises
-            /// ------
-            /// IndexError
-            ///     If *index* is out of range for the stored basis functions.
-            fn draw_weighted_basis<'py>(
-                &self,
-                py: Python<'py>,
-                index: usize,
-                y_pos: $T,
-                x_pos: $T,
-            ) -> Bound<'py, PyArray2<$T>> {
-                self._draw_weighted_basis(index, y_pos, x_pos).into_pyarray(py)
-            }
-
-            /// Return the composite difference kernel at a given spatial position.
-            ///
-            /// Sums all weighted basis functions evaluated at ``(y_pos, x_pos)`` to
-            /// produce the full spatially-varying difference kernel. Each basis
-            /// function is scaled by its learned coefficient and the corresponding
-            /// Chebyshev spatial polynomial evaluated at the given position.
-            ///
-            /// Parameters
-            /// ----------
-            /// y_pos : float
-            ///     Y position (normalized pixel coordinate) for spatial weighting.
-            ///     Should be in ``[-1, +1]`` relative to image center for correct
-            ///     Chebyshev polynomial evaluation.
-            /// x_pos : float
-            ///     X position (normalized pixel coordinate) for spatial weighting.
-            ///     Should be in ``[-1, +1]`` relative to image center for correct
-            ///     Chebyshev polynomial evaluation.
-            ///
-            /// Returns
-            /// -------
-            /// ``numpy.ndarray``
-            ///     2-D composite kernel of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
-            ///
-            /// See Also
-            /// --------
-            /// draw_weighted_basis
-            ///     Return an individual weighted basis function instead of the sum.
-            fn draw_kernel<'py>(
-                &self,
-                py: Python<'py>,
-                y_pos: $T,
-                x_pos: $T,
-            ) -> Bound<'py, PyArray2<$T>> {
-                let mut output =
-                    Array2::<$T>::zeros((self.basis_radius * 2 + 1, self.basis_radius * 2 + 1));
-                for index in 0..self.basis_coefficients.len() {
-                    output += &self._draw_weighted_basis(index, y_pos, x_pos);
+            let mut offset = 0usize;
+            for i in 0..n {
+                let row_len = n - i;
+                let term = *terms_ptr.add(i);
+                let local_basis_ptr = basis_ptr.add(offset);
+                let local_term = terms_ptr.add(i);
+                for k in 0..row_len {
+                    *local_basis_ptr.add(k) += term * *local_term.add(k);
                 }
-                output.into_pyarray(py)
+                offset += row_len;
             }
+        }
 
-            /// Serialize this kernel to a JSON string with a type discriminator.
-            ///
-            /// Embeds a ``"dtype"`` field in the JSON output to identify the kernel
-            /// variant (``DiffKernel`` or ``DiffKernelF32``), enabling correct
-            /// type dispatch during deserialization.
-            ///
-            /// Returns
-            /// -------
-            /// str
-            ///     JSON string representation of the kernel including the dtype tag.
-            ///
-            /// Raises
-            /// ------
-            /// ValueError
-            ///     If serialization fails.
-            fn json(&self) -> PyResult<String> {
-                let data = serde_json::to_value(self)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize kernel: {}", e)))?;
-                let mut map = serde_json::Map::new();
-                map.insert("dtype".to_string(), serde_json::Value::String($type_tag.to_string()));
-                if let serde_json::Value::Object(obj) = data {
-                    for (k, v) in obj {
-                        map.insert(k, v);
-                    }
+        let target_value = target_image[[
+            (*y - kernel_radius) as usize,
+            (**x - kernel_radius) as usize,
+        ]];
+        target_accumulator += &(&terms * target_value);
+    }
+
+    let mut incrementor: usize = 0;
+    unsafe {
+        let basis_accumulator_vec_ptr = basis_accumulator_vec.as_ptr();
+        for i in 0..basis_accumulator.dim().0 {
+            for j in i..basis_accumulator.dim().1 {
+                let basis_value = *basis_accumulator_vec_ptr.add(incrementor);
+
+                basis_accumulator[[i, j]] = basis_value;
+                basis_accumulator[[j, i]] = basis_value;
+                incrementor += 1;
+            }
+        }
+    }
+
+    let coefficients = basis_accumulator.solve(&target_accumulator).unwrap();
+
+    DiffKernelData {
+        basis_arrays: basis_functions
+            .iter()
+            .map(|(y, x)| (y.to_owned(), x.to_owned()))
+            .collect(),
+        basis_radius: kernel_radius as usize,
+        spatial_order,
+        basis_coefficients: coefficients,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The single Python-visible type
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+#[pyclass(name = "DiffKernel")]
+pub struct DiffKernel {
+    inner: DiffKernelInner,
+}
+
+#[pymethods]
+impl DiffKernel {
+    /// Return the basis coefficients array fitted during ``solve_diff_kernel``.
+    ///
+    /// Returns the 1-D array of learned kernel coefficients that weight each
+    /// basis function expanded over the spatial Chebyshev polynomial grid.
+    ///
+    /// Returns
+    /// -------
+    /// ``numpy.ndarray`` of float
+    ///     1-D array of basis coefficients. The dtype matches the kernel type
+    ///     (``float64`` for f64 kernels, ``float32`` for f32 kernels).
+    ///
+    /// Examples
+    /// --------
+    /// >>> coeffs = kernel.get_basis_coefficients()
+    /// >>> print(coeffs.shape)
+    /// (6,)
+    fn get_basis_coefficients<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        match &self.inner {
+            DiffKernelInner::F64(k) => {
+                Ok(k.basis_coefficients.clone().into_pyarray(py).into())
+            }
+            DiffKernelInner::F32(k) => {
+                Ok(k.basis_coefficients.clone().into_pyarray(py).into())
+            }
+        }
+    }
+
+    /// Apply the learned difference kernel to an input image.
+    ///
+    /// Convolves ``input_image`` with the spatially-varying difference kernel
+    /// using the basis functions and coefficients learned by
+    /// ``solve_diff_kernel``. The kernel position is normalized relative
+    /// to the image center using Chebyshev polynomials.
+    ///
+    /// Parameters
+    /// ----------
+    /// input_image : ``numpy.ndarray``
+    ///     2-D input image to process. The dtype must match the kernel type
+    ///     (``float64`` for f64 kernels, ``float32`` for f32 kernels).
+    ///
+    /// Returns
+    /// -------
+    /// ``numpy.ndarray``
+    ///     2-D convolved output array. Its shape is shrunk by
+    ///     ``2 * basis_radius`` in each dimension compared to ``input_image``,
+    ///     i.e. ``(H - 2*R, W - 2*R)`` where ``R`` is the basis radius.
+    ///
+    /// Examples
+    /// --------
+    /// >>> from rubinoxide import DiffKernel
+    /// >>> kernel = DiffKernel.solve_diff_kernel(...)
+    /// >>> result = kernel.apply_kernel(science_image)
+    /// >>> print(result.shape)
+    /// (3960, 3960)
+    ///
+    /// Raises
+    /// ------
+    /// TypeError
+    ///     If *input_image* dtype does not match the kernel's internal dtype.
+    /// ValueError
+    ///     If *input_image* is smaller than ``2 * basis_radius`` in either
+    ///     dimension.
+    fn apply_kernel<'py>(
+        &self,
+        py: Python<'py>,
+        input_image: &Bound<'py, PyAny>,
+    ) -> PyResult<PyObject> {
+        let input_dtype = input_image.getattr("dtype")?;
+
+        match &self.inner {
+            DiffKernelInner::F64(k) => {
+                let dtype_name: String = input_dtype.getattr("name")?.extract()?;
+                if dtype_name != "float64" {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "Kernel is float64 but input image is not float64.",
+                    ));
                 }
-                let final_value = serde_json::Value::Object(map);
-                serde_json::to_string(&final_value)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to format JSON: {}", e)))
+                let arr: PyReadonlyArray2<f64> = input_image.extract()?;
+                let result = k.apply_kernel(arr.as_array());
+                Ok(result.into_pyarray(py).into())
             }
-
-            /// Deserialize a kernel from a JSON string.
-            ///
-            /// Parses the JSON string and reconstructs the kernel instance. The JSON
-            /// must contain a ``"dtype"`` field matching this kernel type.
-            ///
-            /// Parameters
-            /// ----------
-            /// json_str : str
-            ///     JSON string containing serialized kernel data.
-            ///
-            /// Returns
-            /// -------
-            /// kernel instance
-            ///     Reconstructed kernel of the matching type.
-            ///
-            /// Raises
-            /// ------
-            /// ValueError
-            ///     If the JSON is invalid, deserialization fails, or the ``dtype`` is
-            ///     unrecognized.
-            #[staticmethod]
-            fn from_json(json_str: &str) -> PyResult<Self> {
-                let value: serde_json::Value = serde_json::from_str(json_str)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
-                let wrapper: $wrapped_type = serde_json::from_value(value)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to deserialize kernel: {}", e)))?;
-                Ok(wrapper.data)
+            DiffKernelInner::F32(k) => {
+                let dtype_name: String = input_dtype.getattr("name")?.extract()?;
+                if dtype_name != "float32" {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "Kernel is float32 but input image is not float32.",
+                    ));
+                }
+                let arr: PyReadonlyArray2<f32> = input_image.extract()?;
+                let result = k.apply_kernel(arr.as_array());
+                Ok(result.into_pyarray(py).into())
             }
+        }
+    }
 
-            /// Provide Pydantic v2 integration — builds a
-            /// `pydantic_core.core_schema.CoreSchema` so that this type
-            /// can be used as a field type in `pydantic.BaseModel` classes.
-            ///
-            /// Called by Pydantic v2 with the signature:
-            ///   `__get_pydantic_core_schema__(cls, handler, source_type)`
-            /// where `handler` is the Pydantic handler (unused here — we build
-            /// the schema directly via pydantic_core.core_schema).
-            #[classmethod]
-            fn __get_pydantic_core_schema__(
-                _cls: &Bound<'_, pyo3::types::PyType>,
-                py: Python<'_>,
-                _handler: &Bound<'_, PyAny>,
-                _source_type: &Bound<'_, PyAny>,
-            ) -> PyResult<PyObject> {
-                let cs = py.import("pydantic_core.core_schema")?;
-                let json_mod = py.import("json")?;
+    /// Return a single basis function (without spatial weighting or learned coefficients).
+    ///
+    /// Returns the 2-D outer product of the y- and x-components of the
+    /// basis function at the given index, with no multiplication by the
+    /// learned coefficient or any spatial Chebyshev weighting.
+    ///
+    /// Parameters
+    /// ----------
+    /// index : int
+    ///     Index of the basis function to draw (0-based).
+    ///
+    /// Returns
+    /// -------
+    /// ``numpy.ndarray``
+    ///     2-D array of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+    ///
+    /// Raises
+    /// ------
+    /// IndexError
+    ///     If *index* is out of range for the stored basis functions.
+    fn draw_unweighted_basis<'py>(&self, py: Python<'py>, index: usize) -> PyResult<PyObject> {
+        match &self.inner {
+            DiffKernelInner::F64(k) => {
+                Ok(k._draw_unweighted_basis(index).into_pyarray(py).into())
+            }
+            DiffKernelInner::F32(k) => {
+                Ok(k._draw_unweighted_basis(index).into_pyarray(py).into())
+            }
+        }
+    }
 
-                let code = r#"
+    /// Return a single basis function weighted by spatial position and learned coefficients.
+    ///
+    /// Returns the 2-D outer product of the y- and x-components of the
+    /// basis function at the given index, scaled by the corresponding
+    /// learned coefficient and the spatial Chebyshev polynomial term
+    /// evaluated at ``(y_pos, x_pos)``.
+    ///
+    /// Parameters
+    /// ----------
+    /// index : int
+    ///     Index of the weighted basis function to draw (0-based).
+    /// y_pos : float
+    ///     Y position (normalized pixel coordinate) for spatial weighting.
+    ///     Should be in ``[-1, +1]`` relative to image center for correct
+    ///     Chebyshev polynomial evaluation.
+    /// x_pos : float
+    ///     X position (normalized pixel coordinate) for spatial weighting.
+    ///     Should be in ``[-1, +1]`` relative to image center for correct
+    ///     Chebyshev polynomial evaluation.
+    ///
+    /// Returns
+    /// -------
+    /// ``numpy.ndarray``
+    ///     2-D weighted basis function array of shape
+    ///     ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+    ///
+    /// Raises
+    /// ------
+    /// IndexError
+    ///     If *index* is out of range for the stored basis functions.
+    fn draw_weighted_basis<'py>(
+        &self,
+        py: Python<'py>,
+        index: usize,
+        y_pos: f64,
+        x_pos: f64,
+    ) -> PyResult<PyObject> {
+        match &self.inner {
+            DiffKernelInner::F64(k) => Ok(k._draw_weighted_basis(index, y_pos, x_pos).into_pyarray(py).into()),
+            DiffKernelInner::F32(k) => Ok(k._draw_weighted_basis(index, y_pos as f32, x_pos as f32).into_pyarray(py).into()),
+        }
+    }
+
+    /// Return the composite difference kernel at a given spatial position.
+    ///
+    /// Sums all weighted basis functions evaluated at ``(y_pos, x_pos)`` to
+    /// produce the full spatially-varying difference kernel. Each basis
+    /// function is scaled by its learned coefficient and the corresponding
+    /// Chebyshev spatial polynomial evaluated at the given position.
+    ///
+    /// Parameters
+    /// ----------
+    /// y_pos : float
+    ///     Y position (normalized pixel coordinate) for spatial weighting.
+    ///     Should be in ``[-1, +1]`` relative to image center for correct
+    ///     Chebyshev polynomial evaluation.
+    /// x_pos : float
+    ///     X position (normalized pixel coordinate) for spatial weighting.
+    ///     Should be in ``[-1, +1]`` relative to image center for correct
+    ///     Chebyshev polynomial evaluation.
+    ///
+    /// Returns
+    /// -------
+    /// ``numpy.ndarray``
+    ///     2-D composite kernel of shape ``(2 * basis_radius + 1, 2 * basis_radius + 1)``.
+    ///
+    /// See Also
+    /// --------
+    /// draw_weighted_basis
+    ///     Return an individual weighted basis function instead of the sum.
+    fn draw_kernel<'py>(&self, py: Python<'py>, y_pos: f64, x_pos: f64) -> PyResult<PyObject> {
+        match &self.inner {
+            DiffKernelInner::F64(k) => {
+                let mut output = Array2::<f64>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
+                for index in 0..k.basis_coefficients.len() {
+                    output += &k._draw_weighted_basis(index, y_pos, x_pos);
+                }
+                Ok(output.into_pyarray(py).into())
+            }
+            DiffKernelInner::F32(k) => {
+                let y_f32 = y_pos as f32;
+                let x_f32 = x_pos as f32;
+                let mut output = Array2::<f32>::zeros((k.basis_radius * 2 + 1, k.basis_radius * 2 + 1));
+                for index in 0..k.basis_coefficients.len() {
+                    output += &k._draw_weighted_basis(index, y_f32, x_f32);
+                }
+                Ok(output.into_pyarray(py).into())
+            }
+        }
+    }
+
+    /// Serialize this kernel to a JSON string with a type discriminator.
+    ///
+    /// Embeds a ``"dtype"`` field in the JSON output to identify the kernel
+    /// variant (``DiffKernel`` for float64 or ``DiffKernelF32`` for float32),
+    /// enabling correct type dispatch during deserialization.
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///     JSON string representation of the kernel including the dtype tag.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If serialization fails.
+    fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Deserialize a kernel from a JSON string.
+    ///
+    /// Parses the JSON string and reconstructs the kernel instance. The JSON
+    /// must contain a ``"dtype"`` field matching the kernel type.
+    ///
+    /// Parameters
+    /// ----------
+    /// json_str : str
+    ///     JSON string containing serialized kernel data.
+    ///
+    /// Returns
+    /// -------
+    /// ``DiffKernel``
+    ///     Reconstructed kernel of the matching type.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the JSON is invalid, deserialization fails, or the ``dtype`` is
+    ///     unrecognized.
+    #[staticmethod]
+    fn from_json(json_str: &str) -> PyResult<Self> {
+        let inner: DiffKernelInner = serde_json::from_str(json_str).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to deserialize kernel: {}",
+                e
+            ))
+        })?;
+        Ok(DiffKernel { inner })
+    }
+
+    /// Provide Pydantic v2 integration — builds a
+    /// `pydantic_core.core_schema.CoreSchema` so that this type
+    /// can be used as a field type in `pydantic.BaseModel` classes.
+    ///
+    /// Called by Pydantic v2 with the signature:
+    ///   `__get_pydantic_core_schema__(cls, handler, source_type)`
+    /// where `handler` is the Pydantic handler (unused here — we build
+    /// the schema directly via pydantic_core.core_schema).
+    #[classmethod]
+    fn __get_pydantic_core_schema__(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        _handler: &Bound<'_, PyAny>,
+        _source_type: &Bound<'_, PyAny>,
+    ) -> PyResult<PyObject> {
+        let cs = py.import("pydantic_core.core_schema")?;
+        let json_mod = py.import("json")?;
+
+        let code = r#"
 def _build_schema(cls, cs, json_mod, type_err):
     def _validate(v):
         if isinstance(v, cls):
@@ -742,487 +935,301 @@ def _build_schema(cls, cs, json_mod, type_err):
     )
 "#;
 
-                let builtins = py.import("builtins")?;
-                let locals_dict = pyo3::types::PyDict::new(py);
-                let cls_ref = _cls;
-                locals_dict.set_item("cls", cls_ref)?;
-                locals_dict.set_item("cs", &cs)?;
-                locals_dict.set_item("json_mod", &json_mod)?;
-                locals_dict.set_item("type_err", py.get_type::<pyo3::exceptions::PyTypeError>())?;
+        let builtins = py.import("builtins")?;
+        let locals_dict = pyo3::types::PyDict::new(py);
+        let cls_ref = _cls;
+        locals_dict.set_item("cls", cls_ref)?;
+        locals_dict.set_item("cs", &cs)?;
+        locals_dict.set_item("json_mod", &json_mod)?;
+        locals_dict.set_item(
+            "type_err",
+            py.get_type::<pyo3::exceptions::PyTypeError>(),
+        )?;
 
-                builtins.call_method1("exec", (code, &locals_dict))?;
+        builtins.call_method1("exec", (code, &locals_dict))?;
 
-                let builder = locals_dict.get_item("_build_schema")?
-                    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
-                        "Failed to define _build_schema in exec"))?;
+        let builder = locals_dict
+            .get_item("_build_schema")?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Failed to define _build_schema in exec")
+            })?;
 
-                let schema = builder.call1((
-                    cls_ref,
-                    &cs,
-                    &json_mod,
-                    py.get_type::<pyo3::exceptions::PyTypeError>(),
-                ))?;
+        let schema = builder.call1((
+            cls_ref,
+            &cs,
+            &json_mod,
+            py.get_type::<pyo3::exceptions::PyTypeError>(),
+        ))?;
 
-                Ok(schema.into())
-            }
+        Ok(schema.into())
+    }
 
-             /// Provide JSON Schema for OpenAPI / Pydantic documentation.
-            ///
-            /// Called by Pydantic v2 with:
-            ///   `__get_pydantic_json_schema__(cls, core_schema, handler)`
-            #[classmethod]
-            fn __get_pydantic_json_schema__(
-                _cls: &Bound<'_, pyo3::types::PyType>,
-                py: Python<'_>,
-                _core_schema: &Bound<'_, PyAny>,
-                _handler: &Bound<'_, PyAny>,
-            ) -> PyResult<PyObject> {
-                let json_schema_value = serde_json::json!({
-                    "type": "object",
-                    "title": $type_tag,
-                    "description": format!("Serialized {} kernel (dict format)", $type_tag),
-                    "properties": {
-                        "dtype": {"type": "string", "const": $type_tag},
-                        "basis_arrays": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "array",
-                                    "items": {"type": "number"}
-                                }
-                            }
-                        },
-                        "basis_radius": {"type": "integer", "minimum": 0},
-                        "spatial_order": {"type": "integer", "minimum": 0},
-                        "basis_coefficients": {
-                            "type": "array",
-                            "items": {"type": "number"}
-                        }
-                    },
-                    "required": ["dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients"]
-                });
+    /// Provide JSON Schema for OpenAPI / Pydantic documentation.
+    ///
+    /// Called by Pydantic v2 with:
+    ///   `__get_pydantic_json_schema__(cls, core_schema, handler)`
+    #[classmethod]
+    fn __get_pydantic_json_schema__(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        _core_schema: &Bound<'_, PyAny>,
+        _handler: &Bound<'_, PyAny>,
+    ) -> PyResult<PyObject> {
+        let ndarray_obj_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "v": {"type": "integer"},
+                "dim": {"type": "array", "items": {"type": "integer"}},
+                "data": {"type": "array", "items": {"type": "number"}}
+            },
+            "required": ["v", "dim", "data"]
+        });
 
-                let json_str = serde_json::to_string(&json_schema_value)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
-                        "Failed to serialize JSON schema: {}", e)))?;
-
-                let json_mod = py.import("json")?;
-                let py_dict = json_mod.call_method1("loads", (&json_str,))?;
-                Ok(py_dict.into())
-            }
-
-            /// Validate and construct a kernel instance from data.
-            ///
-            /// Pydantic-style classmethod that accepts a kernel instance (pass-through),
-            /// a dict, or a JSON string. Mirrors ``pydantic.BaseModel.model_validate``.
-            ///
-            /// Parameters
-            /// ----------
-            /// data : one of ``DiffKernel``, ``dict``, ``str``
-            ///     The data to validate. If a kernel instance, it is returned directly.
-            ///     If a dict, it is serialized to JSON then deserialized. If a string,
-            ///     it is treated as a JSON string.
-            ///
-            /// Returns
-            /// -------
-            /// kernel instance
-            ///     The constructed or pass-through kernel object.
-            ///
-            /// Raises
-            /// ------
-            /// TypeError
-            ///     If *data* type is not supported (not a kernel instance, dict, or
-            ///     string).
-            #[classmethod]
-            fn model_validate(
-                _cls: &Bound<'_, pyo3::types::PyType>,
-                py: Python<'_>,
-                data: &Bound<'_, PyAny>,
-            ) -> PyResult<Self> {
-                // Already an instance of the correct type?
-                if data.is_instance(_cls)? {
-                    return data.extract::<Self>();
-                }
-
-                // String? → treat as JSON
-                if data.is_instance_of::<pyo3::types::PyString>() {
-                    let json_str: &str = data.extract()?;
-                    return Self::from_json(json_str);
-                }
-
-                // Dict → serialize to JSON, then from_json
-                if data.is_instance_of::<pyo3::types::PyDict>() {
-                    let json_mod = py.import("json")?;
-                    let json_str_obj = json_mod.call_method1("dumps", (data,))?;
-                    let json_str: String = json_str_obj.extract()?;
-                    return Self::from_json(&json_str);
-                }
-
-                let type_name = data.get_type().name()?;
-                Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                    "model_validate expects a {} instance, dict, or JSON string. Got {}.",
-                    std::any::type_name::<Self>(),
-                    type_name
-                )))
-            }
-
-            /// Serialize kernel to a Python dict.
-            ///
-            /// Pydantic-style method that returns a dictionary representation of the
-            /// kernel, including all fields and the dtype tag. Mirrors
-            /// ``pydantic.BaseModel.model_dump``.
-            ///
-            /// Returns
-            /// -------
-            /// ``dict``
-            ///     Dictionary representation of the kernel with all fields including
-            ///     the dtype tag.
-            ///
-            /// Raises
-            /// ------
-            /// ValueError
-            ///     If serialization fails.
-            fn model_dump(&self, py: Python<'_>) -> PyResult<PyObject> {
-                let json_str = self.json()?;
-                let json_mod = py.import("json")?;
-                let py_dict = json_mod.call_method1("loads", (&json_str,))?;
-                Ok(py_dict.into())
-            }
-
-
-            /// Fit difference kernel coefficients by solving a linear system.
-            ///
-            /// Given point source positions and template/target image pairs, solves for
-            /// the set of basis coefficients that best model the difference between the
-            /// template and target images. Each basis function is expanded over spatial
-            /// Chebyshev polynomial terms up to the specified order, allowing the kernel
-            /// to vary across the image.
-            ///
-            /// The template image dimensions must be larger than the target image
-            /// dimensions by ``basis_function_width - 1``. For example, if the target
-            /// image is 4000x4000 and the basis function has length 21, the template
-            /// image should have dimensions 4020x4020 so that there are always pixels
-            /// available to convolve at every valid position.
-            ///
-            /// Parameters
-            /// ----------
-            /// x_values : ``numpy.ndarray`` of int
-            ///     X coordinates of point sources in pixel coordinates.
-            /// y_values : ``numpy.ndarray`` of int
-            ///     Y coordinates of point sources in pixel coordinates.
-            /// basis_functions : list of tuple of ``numpy.ndarray``, ``numpy.ndarray``
-            ///     Separable (y, x) basis function pairs. Each tuple contains two 1-D
-            ///     arrays representing the y-axis and x-axis components of a Gaussian
-            ///     Hermite basis function.
-            /// spatial_order : int
-            ///     Maximum order of the Chebyshev spatial polynomial model. Controls
-            ///     the spatial variability of the difference kernel.
-            /// template_image : ``numpy.ndarray`` of float
-            ///     Reference/template image. Must be at least ``basis_function_width - 1``
-            ///     pixels larger in each dimension than ``target_image``. The dtype must
-            ///     match the kernel type (``float64`` for ``DiffKernel``, ``float32``
-            ///     for ``DiffKernelF32``).
-            /// target_image : ``numpy.ndarray`` of float
-            ///     Science/target image to be difference-imaged against the template.
-            ///     The dtype must match the kernel type (``float64`` for ``DiffKernel``,
-            ///     ``float32`` for ``DiffKernelF32``).
-            ///
-            /// Returns
-            /// -------
-            /// ``DiffKernel`` or ``DiffKernelF32``
-            ///     The fitted kernel object containing the learned basis coefficients,
-            ///     basis functions, spatial order, and kernel radius.
-            ///
-            /// See Also
-            /// --------
-            /// generate_gauss_hermite_basis
-            ///     Precompute Gaussian-Hermite basis functions for use here.
-            /// DiffKernel.apply_kernel
-            ///     Apply the fitted kernel to difference an image.
-            ///
-            /// Examples
-            /// --------
-            /// >>> from rubinoxide import DiffKernel, generate_gauss_hermite_basis
-            /// >>> basis = generate_gauss_hermite_basis(10, [0.5, 1.0, 2.0], [12, 12, 12])
-            /// >>> kernel = DiffKernel.solve_diff_kernel(
-            /// ...     psf_x, psf_y, basis, 3, template, target
-            /// ... )
-            /// >>> coeffs = kernel.get_basis_coefficients()
-            ///
-            /// Raises
-            /// ------
-            /// ValueError
-            ///     If the linear system is singular (e.g., insufficient or
-            ///     degenerate point sources). Also raised if all point sources
-            ///     are filtered out due to being too close to boundaries.
-            #[staticmethod]
-            fn solve_diff_kernel(
-                x_values: PyReadonlyArray1<i32>,
-                y_values: PyReadonlyArray1<i32>,
-                // basis_functions: PyReadonlyArray3<$T>,
-                basis_functions: Vec<(PyReadonlyArray1<$T>, PyReadonlyArray1<$T>)>,
-                // basis_functions: Vec<PyReadonlyArray2<f32>>,
-                spatial_order: u32,
-                template_image: PyReadonlyArray2<$T>,
-                target_image: PyReadonlyArray2<$T>,
-            ) -> PyResult<$struct_name> {
-                // get ndarray views
-                let basis_arrays: Vec<(ArrayView1<$T>, ArrayView1<$T>)> = basis_functions
-                    .iter()
-                    .map(|(y_pyarr, x_pyarr)| (y_pyarr.as_array(), x_pyarr.as_array()))
-                    .collect();
-                let template_array = template_image.as_array();
-                let target_array = target_image.as_array();
-                let x_values_array = x_values.as_array();
-                let y_values_array = y_values.as_array();
-
-                // get needed shapes
-                let kernel_radius = (&basis_arrays[0].0.dim() / 2) as i32;
-                // let kernel_width = (basis_arrays.dim().1 / 2) as i32;
-                let template_shape = template_array.dim();
-
-                let x_mid = template_shape.1 / 2;
-                let y_mid = template_shape.0 / 2;
-
-                let cheb_size = if spatial_order < 1 { 1 } else { spatial_order };
-
-                let mut y_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
-                y_cheb[0] = <$T>::one();
-                let mut x_cheb = Array1::<$T>::zeros((cheb_size + 1) as usize);
-                x_cheb[0] = <$T>::one();
-
-                // filter out any x or y that is too close to bounds
-                let xy_positions: Vec<(&i32, &i32)> = x_values_array
-                    .iter()
-                    .zip(y_values_array.iter())
-                    .filter(|(x, y)| {
-                        **x > kernel_radius as i32
-                            && **x < (template_shape.1 as i32 - (kernel_radius + 2))
-                            && **y > kernel_radius as i32
-                            && **y < (template_shape.0 as i32 - (kernel_radius + 2))
-                    })
-                    .collect();
-
-                let order = (spatial_order) as usize;
-                let size = (order + 1) * (order + 2) / 2;
-                let basis_len = basis_arrays.len();
-                let num_parameters = size * basis_len;
-
-                let mut basis_accumulator = Array2::<$T>::zeros((num_parameters, num_parameters));
-                let mut basis_accumulator_vec =
-                    Array1::<$T>::zeros(num_parameters * (num_parameters + 1) / 2);
-                let mut target_accumulator = Array1::<$T>::zeros(num_parameters);
-
-                let mut spatial_terms_filtered = Array1::<$T>::zeros(size);
-                let x_len = basis_arrays[0].0.dim();
-                let mut basis_values = Array1::<$T>::zeros(basis_len);
-                let mut basis_y_cache = ConvolveCache::new(x_len, basis_len);
-
-                let mut prev_y = i32::MAX;
-                let mut prev_x = i32::MAX;
-
-                let mut terms = Array1::<$T>::zeros(num_parameters);
-                let terms_len = num_parameters;
-
-                for (x, y) in &xy_positions {
-                    convolve_at_one_point(
-                        *x,
-                        *y,
-                        &mut prev_x,
-                        &mut prev_y,
-                        kernel_radius,
-                         basis_len,
-                        &mut basis_values,
-                        &basis_arrays,
-                        &mut basis_y_cache,
-                        &template_array,
-                    );
-     
-                    let poly_y_pos = (<$T as NumCast>::from(**y).unwrap()
-                        - <$T as NumCast>::from(y_mid).unwrap())
-                        / <$T as NumCast>::from(y_mid).unwrap();
-                    let poly_x_pos = (<$T as NumCast>::from(**x).unwrap()
-                        - <$T as NumCast>::from(x_mid).unwrap())
-                        / <$T as NumCast>::from(x_mid).unwrap();
-
-                    y_cheb[1] = poly_y_pos;
-                    x_cheb[1] = poly_x_pos;
-                    for i in 2..spatial_order + 1 {
-                        let i = i as usize;
-                        y_cheb[i] =
-                            <$T as NumCast>::from(2).unwrap() * poly_y_pos * y_cheb[i - 1]
-                                - y_cheb[i - 2];
-                        x_cheb[i] =
-                            <$T as NumCast>::from(2).unwrap() * poly_x_pos * x_cheb[i - 1]
-                                - x_cheb[i - 2];
+        let json_schema_value = serde_json::json!({
+            "type": "object",
+            "title": "DiffKernel",
+            "description": "Serialized DiffKernel kernel (dict format)",
+            "properties": {
+                "dtype": {"type": "string"},
+                "basis_arrays": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": ndarray_obj_schema,
+                        "minItems": 2,
+                        "maxItems": 2
                     }
+                },
+                "basis_radius": {"type": "integer", "minimum": 0},
+                "spatial_order": {"type": "integer", "minimum": 0},
+                "basis_coefficients": ndarray_obj_schema.clone()
+            },
+            "required": ["dtype", "basis_arrays", "basis_radius", "spatial_order", "basis_coefficients"]
+        });
 
-                    let mut index: usize = 0;
-                    for i in 0..(order + 1) {
-                        for j in 0..(order - i + 1) {
-                            spatial_terms_filtered[index] = x_cheb[i] * y_cheb[j];
-                            index += 1;
-                        }
-                    }
+        let json_str = serde_json::to_string(&json_schema_value)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
+                "Failed to serialize JSON schema: {}", e
+            )))?;
 
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod.call_method1("loads", (&json_str,))?;
+        Ok(py_dict.into())
+    }
 
-                    unsafe {
-                        let bv_ptr = basis_values.as_ptr();
-                        let sp_term_filt_ptr = spatial_terms_filtered.as_ptr();
-                        let terms_ptr = terms.as_mut_ptr();
-
-                        let mut terms_offset = 0usize;
-                        for bas in 0..basis_len {
-                            // let bv_val = (basis_values[bas]) as f32;
-                            let bv_val = *bv_ptr.add(bas);
-                            let terms_sub_ptr = terms_ptr.add(terms_offset);
-                            for sp in 0..size {
-                                *terms_sub_ptr.add(sp) = bv_val * *sp_term_filt_ptr.add(sp);
-                            }
-                            terms_offset += size;
-                        }
-                    }
-
-                    unsafe {
-                        let n = terms_len;
-                        let basis_ptr_nn =
-                            ptr::NonNull::new_unchecked(basis_accumulator_vec.as_mut_ptr());
-                        let terms_ptr_nn = ptr::NonNull::new_unchecked(terms.as_mut_ptr());
-                        let basis_ptr = basis_ptr_nn.as_ptr();
-                        let terms_ptr = terms_ptr_nn.as_ptr();
-
-                        let mut offset = 0usize;
-                        for i in 0..n {
-                            let row_len = n - i;
-                            let term = *terms_ptr.add(i);
-                            let local_basis_ptr = basis_ptr.add(offset);
-                            let local_term = terms_ptr.add(i);
-                            for k in 0..row_len {
-                                *local_basis_ptr.add(k) += term * *local_term.add(k);
-                            }
-                            offset += row_len;
-                        }
-                    }
-
-                    let target_value = target_array[[
-                        (*y - kernel_radius) as usize,
-                        (**x - kernel_radius) as usize,
-                    ]];
-                    target_accumulator += &(&terms * target_value);
-                }
-
-                let mut incrementor: usize = 0;
-                unsafe {
-                    let basis_accumulator_vec_ptr = basis_accumulator_vec.as_ptr();
-                    for i in 0..basis_accumulator.dim().0 {
-                        for j in i..basis_accumulator.dim().1 {
-                            let basis_value = *basis_accumulator_vec_ptr.add(incrementor);
-     
-                            basis_accumulator[[i, j]] = basis_value;
-                            basis_accumulator[[j, i]] = basis_value;
-                            incrementor += 1;
-                        }
-                    }
-                }
-
-                let coefficients = basis_accumulator.solve(&target_accumulator).unwrap();
-
-                Ok($struct_name {
-                    basis_arrays: basis_arrays
-                        .iter()
-                        .map(|(y, x)| (y.to_owned(), x.to_owned()))
-                        .collect(),
-                    basis_radius: kernel_radius as usize,
-                    spatial_order,
-                    basis_coefficients: coefficients,
-                })
-            }
+    /// Validate and construct a kernel instance from data.
+    ///
+    /// Pydantic-style classmethod that accepts a kernel instance (pass-through),
+    /// a dict, or a JSON string. Mirrors ``pydantic.BaseModel.model_validate``.
+    ///
+    /// Parameters
+    /// ----------
+    /// data : one of ``DiffKernel``, ``dict``, ``str``
+    ///     The data to validate. If already a DiffKernel instance, it is
+    ///     extracted into a new instance. If a dict, it is serialized to
+    ///     JSON then deserialized. If a string, it is treated as a JSON
+    ///     string.
+    ///
+    /// Returns
+    /// -------
+    /// ``DiffKernel``
+    ///     The constructed or extracted kernel object.
+    ///
+    /// Raises
+    /// ------
+    /// TypeError
+    ///     If *data* type is not supported (not a kernel instance, dict, or
+    ///     string).
+    #[classmethod]
+    fn model_validate(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        if data.is_instance_of::<DiffKernel>() {
+            return data.extract::<Self>();
         }
-    };
-}
-
-impl_diff_kernel_pymethods!(DiffKernelF64, f64, TypedDiffKernelF64, "DiffKernel");
-impl_diff_kernel_pymethods!(DiffKernelF32, f32, TypedDiffKernelF32, "DiffKernelF32");
-
-/// Enum to hold either kernel variant for the dispatcher.
-enum EitherKernel {
-    F64(DiffKernelF64),
-    F32(DiffKernelF32),
-}
-
-/// Internal dispatcher that inspects a JSON string and deserializes the
-/// appropriate kernel type based on the `"dtype"` discriminator field.
-fn parse_and_deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<EitherKernel> {
-    let value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
-
-    match value.get("dtype").and_then(|v| v.as_str()) {
-        Some("DiffKernel") => {
-            let wrapper: TypedDiffKernelF64 = serde_json::from_value(value)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to deserialize DiffKernel: {}", e)))?;
-            Ok(EitherKernel::F64(wrapper.data))
+        if data.is_instance_of::<pyo3::types::PyString>() {
+            let json_str: &str = data.extract()?;
+            return Self::from_json(json_str);
         }
-        Some("DiffKernelF32") => {
-            let wrapper: TypedDiffKernelF32 = serde_json::from_value(value)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to deserialize DiffKernelF32: {}", e)))?;
-            Ok(EitherKernel::F32(wrapper.data))
+        if data.is_instance_of::<pyo3::types::PyDict>() {
+            let json_mod = py.import("json")?;
+            let json_str_obj = json_mod.call_method1("dumps", (data,))?;
+            let json_str: String = json_str_obj.extract()?;
+            return Self::from_json(&json_str);
         }
-        Some(unknown) => {
-            Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown kernel dtype '{}'. Expected 'DiffKernel' or 'DiffKernelF32'",
-                unknown)))
+        let type_name = data.get_type().name()?;
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "model_validate expects a DiffKernel instance, dict, or JSON string. Got {}.",
+            type_name
+        )))
+    }
+
+    /// Serialize kernel to a Python dict.
+    ///
+    /// Pydantic-style method that returns a dictionary representation of the
+    /// kernel, including all fields and the dtype tag. Mirrors
+    /// ``pydantic.BaseModel.model_dump``.
+    ///
+    /// Returns
+    /// -------
+    /// ``dict``
+    ///     Dictionary representation of the kernel with all fields including
+    ///     the dtype tag.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If serialization fails.
+    fn model_dump(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let json_str = self.json()?;
+        let json_mod = py.import("json")?;
+        let py_dict = json_mod.call_method1("loads", (&json_str,))?;
+        Ok(py_dict.into())
+    }
+
+    /// Fit difference kernel coefficients by solving a linear system.
+    ///
+    /// Given point source positions and template/target image pairs, solves for
+    /// the set of basis coefficients that best model the difference between the
+    /// template and target images. Each basis function is expanded over spatial
+    /// Chebyshev polynomial terms up to the specified order, allowing the kernel
+    /// to vary across the image.
+    ///
+    /// The template image dimensions must be larger than the target image
+    /// dimensions by ``basis_function_width - 1``. For example, if the target
+    /// image is 4000x4000 and the basis function has length 21, the template
+    /// image should have dimensions 4020x4020 so that there are always pixels
+    /// available to convolve at every valid position.
+    ///
+    /// Parameters
+    /// ----------
+    /// x_values : ``numpy.ndarray`` of int
+    ///     X coordinates of point sources in pixel coordinates.
+    /// y_values : ``numpy.ndarray`` of int
+    ///     Y coordinates of point sources in pixel coordinates.
+    /// basis_functions : list of tuple of ``numpy.ndarray``, ``numpy.ndarray``
+    ///     Separable (y, x) basis function pairs. Each tuple contains two 1-D
+    ///     arrays representing the y-axis and x-axis components of a Gaussian
+    ///     Hermite basis function.
+    /// spatial_order : int
+    ///     Maximum order of the Chebyshev spatial polynomial model. Controls
+    ///     the spatial variability of the difference kernel.
+    /// template_image : ``numpy.ndarray`` of float
+    ///     Reference/template image. Must be at least ``basis_function_width - 1``
+    ///     pixels larger in each dimension than ``target_image``. The dtype must
+    ///     be float32 or float64.
+    /// target_image : ``numpy.ndarray`` of float
+    ///     Science/target image to be difference-imaged against the template.
+    ///     The dtype must match ``template_image`` (both float32 or both float64).
+    ///
+    /// Returns
+    /// -------
+    /// ``DiffKernel``
+    ///     The fitted kernel object containing the learned basis coefficients,
+    ///     basis functions, spatial order, and kernel radius.
+    ///
+    /// See Also
+    /// --------
+    /// generate_gauss_hermite_basis
+    ///     Precompute Gaussian-Hermite basis functions for use here.
+    /// DiffKernel.apply_kernel
+    ///     Apply the fitted kernel to difference an image.
+    ///
+    /// Examples
+    /// --------
+    /// >>> from rubinoxide import DiffKernel, generate_gauss_hermite_basis
+    /// >>> basis = generate_gauss_hermite_basis(10, [0.5, 1.0, 2.0], [12, 12, 12])
+    /// >>> kernel = DiffKernel.solve_diff_kernel(
+    /// ...     psf_x, psf_y, basis, 3, template, target
+    /// ... )
+    /// >>> coeffs = kernel.get_basis_coefficients()
+    ///
+    /// Raises
+    /// ------
+    /// TypeError
+    ///     If template_image or target_image are not float32 or float64.
+    /// ValueError
+    ///     If the linear system is singular (e.g., insufficient or
+    ///     degenerate point sources). Also raised if all point sources
+    ///     are filtered out due to being too close to boundaries.
+    #[staticmethod]
+    fn solve_diff_kernel(
+        _py: Python<'_>,
+        x_values: &Bound<'_, PyAny>,
+        y_values: &Bound<'_, PyAny>,
+        basis_functions: &Bound<'_, PyAny>,
+        spatial_order: u32,
+        template_image: &Bound<'_, PyAny>,
+        target_image: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let template_dtype = template_image.getattr("dtype")?;
+        let template_dtype_name: String = template_dtype.getattr("name")?.extract()?;
+        let target_dtype = target_image.getattr("dtype")?;
+        let target_dtype_name: String = target_dtype.getattr("name")?.extract()?;
+        if template_dtype_name != target_dtype_name {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "template_image (dtype={}) and target_image (dtype={}) must have the same dtype.",
+                template_dtype_name, target_dtype_name
+            )));
         }
-        None => {
-            Err(pyo3::exceptions::PyValueError::new_err(
-                "JSON missing required 'dtype' field."))
+
+        if template_dtype_name == "float64" {
+            let xv: PyReadonlyArray1<i32> = x_values.extract()?;
+            let yv: PyReadonlyArray1<i32> = y_values.extract()?;
+            let bf: Vec<(PyReadonlyArray1<f64>, PyReadonlyArray1<f64>)> =
+                basis_functions.extract()?;
+            let ti: PyReadonlyArray2<f64> = template_image.extract()?;
+            let tr: PyReadonlyArray2<f64> = target_image.extract()?;
+            let basis_views: Vec<(ArrayView1<f64>, ArrayView1<f64>)> = bf
+                .iter()
+                .map(|(y, x)| (y.as_array(), x.as_array()))
+                .collect();
+            let inner = solve_diff_kernel_impl(
+                xv.as_array(),
+                yv.as_array(),
+                basis_views,
+                spatial_order,
+                ti.as_array(),
+                tr.as_array(),
+            );
+            Ok(DiffKernel {
+                inner: DiffKernelInner::F64(inner),
+            })
+        } else if template_dtype_name == "float32" {
+            let xv: PyReadonlyArray1<i32> = x_values.extract()?;
+            let yv: PyReadonlyArray1<i32> = y_values.extract()?;
+            let bf: Vec<(PyReadonlyArray1<f32>, PyReadonlyArray1<f32>)> =
+                basis_functions.extract()?;
+            let ti: PyReadonlyArray2<f32> = template_image.extract()?;
+            let tr: PyReadonlyArray2<f32> = target_image.extract()?;
+            let basis_views: Vec<(ArrayView1<f32>, ArrayView1<f32>)> = bf
+                .iter()
+                .map(|(y, x)| (y.as_array(), x.as_array()))
+                .collect();
+            let inner = solve_diff_kernel_impl(
+                xv.as_array(),
+                yv.as_array(),
+                basis_views,
+                spatial_order,
+                ti.as_array(),
+                tr.as_array(),
+            );
+            Ok(DiffKernel {
+                inner: DiffKernelInner::F32(inner),
+            })
+        } else {
+            Err(pyo3::exceptions::PyTypeError::new_err(
+                "template_image must be float32 or float64.",
+            ))
         }
     }
 }
 
-/// Deserialize a difference kernel from a JSON string, dispatching to the correct type.
-///
-/// Reads the ``"dtype"`` tag embedded in the JSON to determine whether the
-/// kernel is a ``DiffKernel`` (float64) or ``DiffKernelF32`` (float32) instance,
-/// then reconstructs and returns it.
-///
-/// Parameters
-/// ----------
-/// json_str : str
-///     JSON string containing serialized kernel data, including a ``"dtype"``
-///     field with value ``"DiffKernel"`` or ``"DiffKernelF32"``.
-///
-/// Returns
-/// -------
-/// ``DiffKernel`` or ``DiffKernelF32``
-///     Reconstructed kernel instance matching the dtype in the JSON payload.
-///
-/// Raises
-/// ------
-/// ValueError
-///     If the JSON is invalid, missing the ``"dtype"`` field, or contains an
-///     unrecognized type value.
-///
-/// Examples
-/// --------
-/// >>> kernel_json = kernel.json()
-/// >>> restored = deserialize_diff_kernel(kernel_json)
-/// >>> type(restored)
-/// <class 'DiffKernel'>
-#[pyfunction]
-pub fn deserialize_diff_kernel(py: Python<'_>, json_str: &str) -> PyResult<PyObject> {
-    let either = parse_and_deserialize_diff_kernel(py, json_str)?;
-    match either {
-        EitherKernel::F64(kernel) => {
-            Ok(Py::new(py, kernel)?.into())
-        }
-        EitherKernel::F32(kernel) => {
-            Ok(Py::new(py, kernel)?.into())
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Basis generation helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 /// Computes the nth Hermite polynomial at x using recurrence.
 fn hermite_polynomial<T: NdFloat + Default>(x: T, n: usize, amplitude: T) -> T {
@@ -1392,7 +1399,7 @@ pub fn generate_gauss_hermite_basis_f64<'py>(
 /// --------
 /// generate_gauss_hermite_basis
 ///     Float64 variant, also aliased as ``generate_gauss_hermite_basis``.
-/// DiffKernelF32.solve_diff_kernel
+/// DiffKernel.solve_diff_kernel
 ///     Fits optimal kernel coefficients against template/target images.
 ///
 /// Examples
@@ -1419,180 +1426,332 @@ pub fn generate_gauss_hermite_basis_f32<'py>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_json_roundtrip_f64() {
-        let basis5 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        let basis6 = Array1::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0]);
-        let coeff6 = Array1::from_vec(vec![0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]);
-
-        let kernel = DiffKernelF64 {
-            basis_arrays: vec![(basis5.clone(), basis6.clone()), (basis6, basis5)],
+    fn create_test_kernel_f64() -> DiffKernelData<f64> {
+        let basis1 = Array1::from_vec(vec![1.0f64, 2.0, 3.0, 4.0, 5.0]);
+        let basis2 = Array1::from_vec(vec![5.0f64, 4.0, 3.0, 2.0, 1.0]);
+        let coeffs = Array1::from_vec(vec![0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        DiffKernelData {
+            basis_arrays: vec![(basis1, basis2)],
             basis_radius: 2,
             spatial_order: 1,
-            basis_coefficients: coeff6,
-        };
+            basis_coefficients: coeffs,
+        }
+    }
 
-        let json = serde_json::to_string(&kernel).unwrap();
-        let restored: DiffKernelF64 = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(kernel.basis_radius, restored.basis_radius);
-        assert_eq!(kernel.spatial_order, restored.spatial_order);
-        assert!(
-            kernel.basis_coefficients
-                .iter()
-                .zip(restored.basis_coefficients.iter())
-                .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0)
-        );
-        assert_eq!(kernel.basis_arrays.len(), restored.basis_arrays.len());
-        for ((oy, ox), (ry, rx)) in kernel
-            .basis_arrays
-            .iter()
-            .zip(restored.basis_arrays.iter())
-        {
-            assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
-            assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+    fn create_test_kernel_f32() -> DiffKernelData<f32> {
+        let basis1 = Array1::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        let basis2 = Array1::from_vec(vec![5.0f32, 4.0, 3.0, 2.0, 1.0]);
+        let coeffs = Array1::from_vec(vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        DiffKernelData {
+            basis_arrays: vec![(basis1, basis2)],
+            basis_radius: 2,
+            spatial_order: 1,
+            basis_coefficients: coeffs,
         }
     }
 
     #[test]
-    fn test_json_roundtrip_f32() {
-        let basis5 = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        let basis6 = Array1::from_vec(vec![5.0, 4.0, 3.0, 2.0, 1.0]);
-        let coeff6 = Array1::from_vec(vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    fn test_json_roundtrip_inner_f64() {
+        let original = create_test_kernel_f64();
+        let tagged = DiffKernelInner::F64(original);
+        let json = serde_json::to_string(&tagged).unwrap();
+        let restored: DiffKernelInner = serde_json::from_str(&json).unwrap();
 
-        let kernel = DiffKernelF32 {
-            basis_arrays: vec![(basis5.clone(), basis6.clone()), (basis6, basis5)],
-            basis_radius: 2,
-            spatial_order: 1,
-            basis_coefficients: coeff6,
-        };
+        match (&tagged, &restored) {
+            (DiffKernelInner::F64(o), DiffKernelInner::F64(r)) => {
+                assert_eq!(o.basis_radius, r.basis_radius);
+                assert_eq!(o.spatial_order, r.spatial_order);
+                assert!(o
+                    .basis_coefficients
+                    .iter()
+                    .zip(r.basis_coefficients.iter())
+                    .all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+                assert_eq!(o.basis_arrays.len(), r.basis_arrays.len());
+                for ((oy, ox), (ry, rx)) in o
+                    .basis_arrays
+                    .iter()
+                    .zip(r.basis_arrays.iter())
+                {
+                    assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+                    assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f64::EPSILON * 10.0));
+                }
+            }
+            _ => panic!("Expected F64 variant"),
+        }
+    }
 
-        let json = serde_json::to_string(&kernel).unwrap();
-        let restored: DiffKernelF32 = serde_json::from_str(&json).unwrap();
+    #[test]
+    fn test_json_roundtrip_inner_f32() {
+        let original = create_test_kernel_f32();
+        let tagged = DiffKernelInner::F32(original);
+        let json = serde_json::to_string(&tagged).unwrap();
+        let restored: DiffKernelInner = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(kernel.basis_radius, restored.basis_radius);
-        assert_eq!(kernel.spatial_order, restored.spatial_order);
-        assert!(
-            kernel.basis_coefficients
-                .iter()
-                .zip(restored.basis_coefficients.iter())
-                .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0)
-        );
-        assert_eq!(kernel.basis_arrays.len(), restored.basis_arrays.len());
-        for ((oy, ox), (ry, rx)) in kernel
-            .basis_arrays
-            .iter()
-            .zip(restored.basis_arrays.iter())
-        {
-            assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
-            assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+        match (&tagged, &restored) {
+            (DiffKernelInner::F32(o), DiffKernelInner::F32(r)) => {
+                assert_eq!(o.basis_radius, r.basis_radius);
+                assert_eq!(o.spatial_order, r.spatial_order);
+                assert!(o
+                    .basis_coefficients
+                    .iter()
+                    .zip(r.basis_coefficients.iter())
+                    .all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+                assert_eq!(o.basis_arrays.len(), r.basis_arrays.len());
+                for ((oy, ox), (ry, rx)) in o
+                    .basis_arrays
+                    .iter()
+                    .zip(r.basis_arrays.iter())
+                {
+                    assert!(oy.iter().zip(ry.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+                    assert!(ox.iter().zip(rx.iter()).all(|(a, b)| (a - b).abs() < f32::EPSILON * 10.0));
+                }
+            }
+            _ => panic!("Expected F32 variant"),
         }
     }
 
     #[test]
     fn test_from_json_invalid() {
-        let res: Result<DiffKernelF64, _> = serde_json::from_str("not valid json");
+        let res: Result<DiffKernelInner, _> = serde_json::from_str("not valid json");
         assert!(res.is_err());
     }
 
-    /// Test that tagged serialization (via TypedDiffKernel wrapper) produces correct "dtype".
     #[test]
-    fn test_tagged_serialize_f64() {
-        let kernel = create_test_kernel_f64();
-        let wrapper = TypedDiffKernelF64 {
-            dtype_value: "DiffKernel".to_string(),
-            data: kernel,
-        };
-        let json = serde_json::to_string(&wrapper).unwrap();
+    fn test_deserialize_f64_by_dtype() {
+        // Serialize a real f64 kernel, then deserialize and verify
+        let original = create_test_kernel_f64();
+        let tagged = DiffKernelInner::F64(original);
+        let json_str = serde_json::to_string(&tagged).unwrap();
+        // Verify the JSON has the correct dtype tag
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
+        // Deserialize back
+        let result: DiffKernelInner = serde_json::from_str(&json_str).unwrap();
+        match result {
+            DiffKernelInner::F64(k) => {
+                assert_eq!(k.basis_radius, 2);
+                assert_eq!(k.spatial_order, 1);
+                assert_eq!(k.basis_coefficients.len(), 6);
+            }
+            _ => panic!("Expected F64 variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_f32_by_dtype() {
+        // Serialize a real f32 kernel, then deserialize and verify
+        let original = create_test_kernel_f32();
+        let tagged = DiffKernelInner::F32(original);
+        let json_str = serde_json::to_string(&tagged).unwrap();
+        // Verify the JSON has the correct dtype tag
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernelF32"));
+        // Deserialize back
+        let result: DiffKernelInner = serde_json::from_str(&json_str).unwrap();
+        match result {
+            DiffKernelInner::F32(k) => {
+                assert_eq!(k.basis_radius, 2);
+                assert_eq!(k.spatial_order, 1);
+                assert_eq!(k.basis_coefficients.len(), 6);
+            }
+            _ => panic!("Expected F32 variant"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_unknown_dtype() {
+        let json = serde_json::json!({
+            "dtype": "UnknownType",
+            "basis_arrays": [],
+            "basis_radius": 0,
+            "spatial_order": 0,
+            "basis_coefficients": []
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let result: Result<DiffKernelInner, _> = serde_json::from_str(&json_str);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("UnknownType"));
+    }
+
+    #[test]
+    fn test_deserialize_missing_dtype() {
+        let json = serde_json::json!({
+            "basis_arrays": [],
+            "basis_radius": 0,
+            "spatial_order": 0,
+            "basis_coefficients": []
+        });
+        let json_str = serde_json::to_string(&json).unwrap();
+        let result: Result<DiffKernelInner, _> = serde_json::from_str(&json_str);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("dtype"));
+    }
+
+    /// Verify serialization of DiffKernelInner produces the expected "dtype" field.
+    #[test]
+    fn test_serialize_f64_has_dtype_tag() {
+        let original = create_test_kernel_f64();
+        let tagged = DiffKernelInner::F64(original);
+        let json = serde_json::to_string(&tagged).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
         assert!(value.get("basis_radius").is_some());
         assert!(value.get("basis_arrays").is_some());
     }
 
-    /// Test that tagged serialization (via TypedDiffKernel wrapper) produces correct "dtype".
     #[test]
-    fn test_tagged_serialize_f32() {
-        let kernel = create_test_kernel_f32();
-        let wrapper = TypedDiffKernelF32 {
-            dtype_value: "DiffKernelF32".to_string(),
-            data: kernel,
-        };
-        let json = serde_json::to_string(&wrapper).unwrap();
+    fn test_serialize_f32_has_dtype_tag() {
+        let original = create_test_kernel_f32();
+        let tagged = DiffKernelInner::F32(original);
+        let json = serde_json::to_string(&tagged).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value.get("dtype").and_then(|v| v.as_str()), Some("DiffKernelF32"));
+        assert!(value.get("basis_radius").is_some());
     }
 
-    /// Test round-trip through TypedDiffKernelF64 wrapper.
+    /// Test DiffKernel wrapper construction and clone.
     #[test]
-    fn test_roundtrip_via_typed_wrapper_f64() {
-        let original = create_test_kernel_f64();
-        let wrapper = TypedDiffKernelF64 {
-            dtype_value: "DiffKernel".to_string(),
-            data: original,
+    fn test_diff_kernel_wrapper_f64() {
+        let inner = create_test_kernel_f64();
+        let dk = DiffKernel {
+            inner: DiffKernelInner::F64(inner.clone()),
         };
-        let json = serde_json::to_string(&wrapper).unwrap();
-        let restored: TypedDiffKernelF64 = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.dtype_value, "DiffKernel");
-        assert_eq!(restored.data.basis_radius, 2);
-        assert_eq!(restored.data.spatial_order, 1);
-    }
-
-    /// Test round-trip through TypedDiffKernelF32 wrapper.
-    #[test]
-    fn test_roundtrip_via_typed_wrapper_f32() {
-        let original = create_test_kernel_f32();
-        let wrapper = TypedDiffKernelF32 {
-            dtype_value: "DiffKernelF32".to_string(),
-            data: original,
-        };
-        let json = serde_json::to_string(&wrapper).unwrap();
-        let restored: TypedDiffKernelF32 = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.dtype_value, "DiffKernelF32");
-        assert_eq!(restored.data.basis_radius, 2);
-    }
-
-    /// Test that the to_json_map utility function produces correct tagged output for f64.
-    /// This mirrors what the `json` pymethod does.
-    #[test]
-    fn test_to_json_map_approach_f64() {
-        let kernel = create_test_kernel_f64();
-        let data = serde_json::to_value(&kernel).unwrap();
-        let mut map = serde_json::Map::new();
-        map.insert("dtype".to_string(), serde_json::Value::String("DiffKernel".to_string()));
-        if let serde_json::Value::Object(obj) = data {
-            for (k, v) in obj {
-                map.insert(k, v);
+        let dk2 = dk.clone();
+        // Round-trip via json
+        match &dk2.inner {
+            DiffKernelInner::F64(k) => {
+                assert_eq!(k.basis_radius, 2);
+                assert_eq!(k.basis_coefficients.len(), 6);
             }
-        }
-        let final_value = serde_json::Value::Object(map);
-        let json = serde_json::to_string(&final_value).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.get("dtype").and_then(|v| v.as_str()), Some("DiffKernel"));
-        assert!(parsed.get("basis_radius").is_some());
-    }
-
-    fn create_test_kernel_f64() -> DiffKernelF64 {
-        let basis1 = Array1::from_vec(vec![1.0f64, 2.0, 3.0, 4.0, 5.0]);
-        let basis2 = Array1::from_vec(vec![5.0f64, 4.0, 3.0, 2.0, 1.0]);
-        let coeffs = Array1::from_vec(vec![0.1f64, 0.2, 0.3, 0.4, 0.5, 0.6]);
-        DiffKernelF64 {
-            basis_arrays: vec![(basis1, basis2)],
-            basis_radius: 2,
-            spatial_order: 1,
-            basis_coefficients: coeffs,
+            _ => panic!("Expected F64"),
         }
     }
 
-    fn create_test_kernel_f32() -> DiffKernelF32 {
-        let basis1 = Array1::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0]);
-        let basis2 = Array1::from_vec(vec![5.0f32, 4.0, 3.0, 2.0, 1.0]);
-        let coeffs = Array1::from_vec(vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]);
-        DiffKernelF32 {
-            basis_arrays: vec![(basis1, basis2)],
-            basis_radius: 2,
-            spatial_order: 1,
-            basis_coefficients: coeffs,
+    #[test]
+    fn test_diff_kernel_wrapper_f32() {
+        let inner = create_test_kernel_f32();
+        let dk = DiffKernel {
+            inner: DiffKernelInner::F32(inner.clone()),
+        };
+        let dk2 = dk.clone();
+        match &dk2.inner {
+            DiffKernelInner::F32(k) => {
+                assert_eq!(k.basis_radius, 2);
+                assert_eq!(k.basis_coefficients.len(), 6);
+            }
+            _ => panic!("Expected F32"),
         }
+    }
+
+    /// Test apply_kernel method on DiffKernelData<f64>
+    #[test]
+    fn test_apply_kernel_f64() {
+        let kernel = create_test_kernel_f64();
+        // Create a simple 10x10 test image
+        let input = Array2::<f64>::from_shape_fn((10, 10), |(_, _)| 1.0);
+        let result = kernel.apply_kernel(input.view());
+        // Output should be (10 - 2*2, 10 - 2*2) = (6, 6)
+        assert_eq!(result.shape(), &[6, 6]);
+    }
+
+    /// Test apply_kernel method on DiffKernelData<f32>
+    #[test]
+    fn test_apply_kernel_f32() {
+        let kernel = create_test_kernel_f32();
+        // Create a simple 10x10 test image
+        let input = Array2::<f32>::from_shape_fn((10, 10), |(_, _)| 1.0f32);
+        let result = kernel.apply_kernel(input.view());
+        // Output should be (10 - 2*2, 10 - 2*2) = (6, 6)
+        assert_eq!(result.shape(), &[6, 6]);
+    }
+
+    /// Test _draw_unweighted_basis method
+    #[test]
+    fn test_draw_unweighted_basis() {
+        let kernel = create_test_kernel_f64();
+        let basis = kernel._draw_unweighted_basis(0);
+        // Should be (2*radius+1, 2*radius+1) = (5, 5)
+        assert_eq!(basis.shape(), &[5, 5]);
+    }
+
+    /// Verify ndarray serde serialization format matches the JSON schema.
+    /// Array1<T> serializes as {"v": 1, "dim": [N], "data": [...]}.
+    /// Vec<(Array1, Array1)> serializes as [[obj, obj], ...].
+    #[test]
+    fn test_json_schema_structure_matches_serialization() {
+        let original = create_test_kernel_f64();
+        let tagged = DiffKernelInner::F64(original);
+        let json = serde_json::to_string(&tagged).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // dtype is a string
+        assert!(value.get("dtype").is_some());
+        assert_eq!(value["dtype"], "DiffKernel");
+
+        // basis_coefficients has ndarray format: {v, dim, data}
+        let bc = &value["basis_coefficients"];
+        assert!(bc.get("v").is_some(), "basis_coefficients missing 'v'");
+        assert!(bc.get("dim").is_some(), "basis_coefficients missing 'dim'");
+        assert!(bc.get("data").is_some(), "basis_coefficients missing 'data'");
+        assert_eq!(bc["v"], 1);
+        assert!(bc["dim"].is_array());
+        assert!(bc["data"].is_array());
+        assert_eq!(bc["data"].as_array().unwrap().len(), 6);
+
+        // basis_arrays is an array of 2-element arrays of ndarray objects
+        let ba = &value["basis_arrays"];
+        assert!(ba.is_array());
+        assert_eq!(ba.as_array().unwrap().len(), 1);
+        let first_pair = &ba[0];
+        assert!(first_pair.is_array());
+        assert_eq!(first_pair.as_array().unwrap().len(), 2);
+        // Both elements have ndarray object format
+        for elem in first_pair.as_array().unwrap() {
+            assert!(elem.get("v").is_some(), "basis_arrays element missing 'v'");
+            assert!(elem.get("dim").is_some(), "basis_arrays element missing 'dim'");
+            assert!(elem.get("data").is_some(), "basis_arrays element missing 'data'");
+            assert_eq!(elem["v"], 1);
+        }
+    }
+
+    /// Test solve_diff_kernel_impl produces a valid kernel
+    #[test]
+    fn test_solve_impl_f64() {
+        // Create minimal 5x5 basis functions (identity-like kernel)
+        let basis_y = Array1::<f64>::from_vec(vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+        let basis_x = Array1::<f64>::from_vec(vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+        let basis_functions = vec![(basis_y.view(), basis_x.view())];
+
+        // Create 20x20 template with known values
+        let mut template = Array2::<f64>::zeros((20, 20));
+        template[[8, 8]] = 1.0;
+        template[[10, 10]] = 2.0;
+        template[[12, 12]] = 3.0;
+
+        // Create 16x16 target with known values
+        let mut target = Array2::<f64>::zeros((16, 16));
+        target[[6, 6]] = 1.5;
+        target[[8, 8]] = 2.5;
+        target[[10, 10]] = 3.5;
+
+        // Point sources well inside the image (offset from edges by radius=2)
+        let x_values = Array1::from_vec(vec![8i32, 10i32, 12i32]);
+        let y_values = Array1::from_vec(vec![8i32, 10i32, 12i32]);
+
+        let result = solve_diff_kernel_impl(
+            x_values.view(),
+            y_values.view(),
+            basis_functions,
+            0u32,
+            template.view(),
+            target.view(),
+        );
+
+        assert_eq!(result.basis_radius, 2);
+        assert_eq!(result.spatial_order, 0);
+        // With spatial_order=0, size=1, 1 basis function: num_parameters = 1 * 1 = 1
+        assert_eq!(result.basis_coefficients.len(), 1);
     }
 }
