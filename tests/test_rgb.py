@@ -157,19 +157,48 @@ class DiffusionTestCase(TestCase):
         right_mean = result[20, 29].mean()
         np.testing.assert_allclose(right_mean, 0.7, atol=0.1)
 
-    def test_inpaint_noise_varies(self):
-        """Multiple inpainting runs should show noise variation"""
+    def test_inpaint_no_boundary_overshoot_ring(self):
+        """The hf-sharpening taper (2b) removes the boundary overshoot/dip ring.
+
+        A constant image with a rectangular mask must not exhibit a boundary
+        ring or two-pixel bright/dark dipole (values rising above then dipping
+        below the background) that the fourth-order diffusion term would
+        otherwise amplify from the decomposition step at the mask edge.
+        """
+        test_image = np.ones((60, 60), dtype=np.float64) * 0.5
+        mask = np.zeros((60, 60), dtype=bool)
+        mask[20:40, 20:40] = True
+
+        result = rgb.inpaint_mask(test_image, mask, iterations=32, random_seed=42, radius=5.0)
+
+        row = result[30, :]
+        interior = row[24:36]
+        self.assertLess(interior.max(), 0.5 + 0.03)
+        self.assertGreater(interior.min(), 0.5 - 0.03)
+        # The ring/dipole manifests as values well above/below the background
+        # near the mask edge, so check the whole masked region stays near 0.5.
+        masked = result[mask]
+        self.assertLess(masked.max(), 0.5 + 0.03)
+        self.assertGreater(masked.min(), 0.5 - 0.03)
+
+    def test_inpaint_noise_init_inverse(self):
+        """init_method='noise' seeds the masked pixels stochastically, so a
+        single masked pixel produces seed-to-seed variation (the stochastic
+        structure is preserved, not flattened out by a smoothing band)."""
         test_image = np.ones((50, 50), dtype=np.float64) * 0.5
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[25, 25] = True
 
         results = []
         for seed in range(10):
-            np.random.seed(seed)
-            mask = np.zeros((50, 50), dtype=bool)
-            mask[25, 25] = True
-            result = rgb.inpaint_mask(test_image, mask, iterations=5, random_seed=seed)
+            result = rgb.inpaint_mask(
+                test_image, mask, iterations=5, random_seed=seed, init_method="noise"
+            )
             results.append(result[25, 25])
 
+        # The noise init contributes real per-seed structure.
         self.assertGreater(np.std(results), 0.01)
+        self.assertTrue(np.all(np.isfinite(results)))
 
     def test_inpaint_all_masked_valid(self):
         """All pixels masked should still return valid result"""
@@ -221,6 +250,197 @@ class DiffusionTestCase(TestCase):
         result_large = rgb.diffuse_gray_image(test_image, iterations=5, radius=5.0)
 
         self.assertLess(result_large[25, 25], result_small[25, 25])
+
+    def test_inpaint_mask_decomposition_no_contamination(self):
+        """The mask-aware decomposition should prevent masked-region values
+        from contaminating HF components at nearby unmasked pixels.
+
+        Uses a constant image with a distinctive masked region value.
+        Unmasked pixels just outside the mask should NOT be altered.
+        """
+        # Constant image with a block of different value in the mask
+        test_image = np.ones((30, 30), dtype=np.float64) * 10.0
+        mask = np.zeros((30, 30), dtype=bool)
+        # Mask a 10x10 center
+        mask[10:20, 10:20] = True
+
+        # Set masked pixels to a very different value (simulating saturated star)
+        test_image[10:20, 10:20] = 1000.0
+
+        result = rgb.inpaint_mask(
+            test_image, mask, iterations=10, random_seed=42, radius=3.0
+        )
+
+        # Unmasked pixels far from mask should be preserved exactly
+        np.testing.assert_allclose(
+            result[0:8, 0:8], test_image[0:8, 0:8], atol=1e-10
+        )
+
+        # Unmasked pixels where the B-spline filter crosses the mask boundary
+        # should also be preserved (the mask-aware decomposition excludes
+        # masked neighbors from the filter).
+        # Position (9, 15): unmasked, but vertical filter at row 9 includes
+        #   rows 10,11 which ARE masked → with fix, those are excluded
+        np.testing.assert_allclose(
+            result[9, 15], test_image[9, 15], atol=1e-6,
+        )
+        # Position (15, 9): unmasked, but horizontal filter at col 9 includes
+        #   cols 10,11 which ARE masked → with fix, those are excluded
+        np.testing.assert_allclose(
+            result[15, 9], test_image[15, 9], atol=1e-6,
+        )
+
+        # All values should be finite
+        self.assertTrue(np.isfinite(result).all())
+
+    def test_inpaint_saturated_star_ab_channel(self):
+        """Simulate a saturated star in the a/b channel: extreme values
+        in the mask that should not contaminate the decomposition of
+        surrounding pixels.
+        """
+        np.random.seed(42)
+        # Background with smooth gradient (offset to non-negative)
+        y, x = np.mgrid[0:40, 0:40]
+        background = 128.0 + (x + y) * 0.1
+
+        # Saturated star in center: extreme value
+        test_image = background.astype(np.float64)
+        test_image[15:25, 15:25] = 1000.0  # extreme saturated value
+
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[15:25, 15:25] = True
+
+        result = rgb.inpaint_mask(
+            test_image, mask, iterations=32, random_seed=42, radius=5.0
+        )
+
+        # Pixels far from the mask should be unaffected
+        np.testing.assert_allclose(
+            result[0:10, 0:10], test_image[0:10, 0:10], atol=1e-10
+        )
+
+        # Pixels just outside the mask should NOT show contamination
+        # from the extreme 1000.0 value inside the mask
+        boundary_band = result[13:15, 13:27]  # 2 rows just above mask
+        self.assertLess(
+            boundary_band.max(), 200.0,
+            "Boundary pixels should not be contaminated by extreme masked values"
+        )
+
+        # Result should be finite everywhere
+        self.assertTrue(np.isfinite(result).all())
+
+    def test_inpaint_boundary_fill_no_offset_negative(self):
+        """boundary_fill (default) should handle Lab a/b-like values centered
+        around zero with NO offsetting required, and produce a smooth boundary.
+        """
+        np.random.seed(42)
+        # Smooth star-like profile in an a-channel, centered around 0
+        y, x = np.mgrid[0:40, 0:40]
+        r2 = (x - 20)**2 + (y - 20)**2
+        profile = 30.0 * np.exp(-r2 / 60.0)  # can be positive or negative-ish
+        # Add a mild tilt so the field is not perfectly symmetric
+        test_image = (profile + (x - 20) * 0.2).astype(np.float64)
+
+        mask = np.zeros((40, 40), dtype=bool)
+        mask[14:26, 14:26] = True  # mask the star core
+
+        # No offsetting applied. Should not panic with negative values.
+        result = rgb.inpaint_mask(
+            test_image, mask, iterations=32, random_seed=42, radius=5.0
+        )
+
+        self.assertTrue(np.isfinite(result).all())
+
+        # Unmasked pixels preserved exactly
+        np.testing.assert_allclose(
+            result[0:12, 0:12], test_image[0:12, 0:12], atol=1e-10
+        )
+
+        # Smooth boundary: no large jump between masked (col 14) and
+        # unmasked (col 13) pixels at the mask edge.
+        row = 20
+        jump = abs(result[row, 14] - result[row, 13])
+        self.assertLess(
+            jump, 20.0,
+            "boundary_fill should not create a large discontinuity at the mask edge"
+        )
+
+    def test_inpaint_boundary_fill_converges_faster_than_noise(self):
+        """boundary_fill should reach near the true solution in far fewer
+        iterations than the legacy noise initialization.
+        """
+        # Constant image; the true inpainted interior value is 0.5
+        test_image = np.ones((50, 50), dtype=np.float64) * 0.5
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[18:32, 18:32] = True
+
+        # At a LOW iteration count, boundary_fill should already be close to
+        # the true value, while the noise init lags behind.
+        bf = rgb.inpaint_mask(
+            test_image, mask, iterations=3, random_seed=1, init_method="boundary_fill"
+        )[25, 25]
+        noise = rgb.inpaint_mask(
+            test_image, mask, iterations=3, random_seed=1, init_method="noise"
+        )[25, 25]
+
+        self.assertLess(
+            abs(bf - 0.5), abs(noise - 0.5),
+            "boundary_fill should be closer to the true value than noise at low iterations"
+        )
+        self.assertLess(abs(bf - 0.5), 0.05)
+
+    def test_inpaint_boundary_fill_retains_texture(self):
+        """boundary_fill should retain spatial structure from the surrounding
+        image rather than flattening the masked region to a constant.
+        A constant image yields a constant fill, but a textured image should
+        produce a textured (spatially varying) inpainted region.
+        """
+        # Image with a sinusoidal texture overlaying a base gradient.
+        np.random.seed(7)
+        y, x = np.mgrid[0:50, 0:50]
+        base = 10.0 + (x + y) * 0.02
+        texture = 0.3 * np.sin(x * 1.7) * np.cos(y * 2.3)
+        test_image = (base + texture).astype(np.float64)
+
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[20:30, 20:30] = True
+
+        result = rgb.inpaint_mask(
+            test_image, mask, iterations=5, random_seed=1,
+            init_method="boundary_fill", radius=3.0
+        )
+
+        # The inpainted region should retain spatial variation (not be a
+        # flat constant), following the boundary texture.
+        inpainted = result[20:30, 20:30]
+        self.assertGreater(
+            inpainted.std(), 0.05,
+            "boundary_fill should retain spatial structure in the masked region"
+        )
+
+        # The result stays bounded (finite, sensible range), not exploding
+        # from the seed noise.
+        self.assertTrue(np.isfinite(inpainted).all())
+        self.assertLess(np.abs(inpainted).max(), 100.0)
+
+    def test_inpaint_noise_method_still_works(self):
+        """init_method='noise' remains functional: results stay finite and
+        bounded near the background level for a single masked pixel (no runaway
+        overshoot once the fill is no longer clipped)."""
+        test_image = np.ones((50, 50), dtype=np.float64) * 0.5
+        mask = np.zeros((50, 50), dtype=bool)
+        mask[25, 25] = True
+
+        results = []
+        for seed in range(10):
+            result = rgb.inpaint_mask(
+                test_image, mask, iterations=5, random_seed=seed, init_method="noise"
+            )
+            results.append(result[25, 25])
+
+        self.assertTrue(np.isfinite(np.array(results)).all())
+        self.assertLess(np.abs(np.array(results) - 0.5).max(), 0.2)
 
 
 class MemoryTestCase(MemoryTestCase):
