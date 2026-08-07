@@ -36,7 +36,7 @@ mod color_spaces;
 mod rgb_diffusion;
 pub use color_spaces::{Oklab_to_RGB, RGB_to_Oklab};
 use pyo3::prelude::*;
-pub use rgb_diffusion::{diffuse_gray_image, inpaint_mask};
+pub use rgb_diffusion::{diffuse_gray_image, inpaint_mask, reconstruct_star_color};
 
 // This function is called by the main python module rubinoxide. Its job
 // is to create a new sub moduled named rgb, and bind the declared
@@ -48,5 +48,6 @@ pub fn create_rgb_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     rgb_module.add_function(wrap_pyfunction!(RGB_to_Oklab, &rgb_module)?)?;
     rgb_module.add_function(wrap_pyfunction!(diffuse_gray_image, &rgb_module)?)?;
     rgb_module.add_function(wrap_pyfunction!(inpaint_mask, &rgb_module)?)?;
+    rgb_module.add_function(wrap_pyfunction!(reconstruct_star_color, &rgb_module)?)?;
     parent_module.add_submodule(&rgb_module)
 }

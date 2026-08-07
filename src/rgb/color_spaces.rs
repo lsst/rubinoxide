@@ -293,6 +293,57 @@ pub fn Oklab_to_RGB<'py>(
     Ok(result_array)
 }
 
+// ---------------------------------------------------------------------------
+// Single-colour helpers shared with rgb_diffusion (saturated-star colour
+// reconstruction). These use the library's own Oklab convention (D65, no
+// additional whitepoint shift) and expose a flux-additive linear-RGB space for
+// integrating conserved per-band flux. The linear space is what makes the
+// integration meaningful: mis-aligned chromatic diffraction spikes still
+// conserve total per-band flux, so the ratio of the integrated linear-RGB sums
+// recovers the star's intrinsic colour.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn mat3_mul(m: &[f64; 9], v: &[f64; 3]) -> [f64; 3] {
+    [
+        m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+        m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+        m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+    ]
+}
+
+/// Convert a single Oklab colour to flux-additive linear RGB, matching the
+/// library's own RGB<->Oklab convention (D65 white point, no extra shift).
+///
+/// `lab` is `[L, a, b]`. The result is the linear RGB before any gamma/transfer
+/// function, where pixel values may be summed to conserve flux.
+pub(crate) fn oklab_to_linear_rgb(lab: [f64; 3]) -> [f64; 3] {
+    let lms_ = mat3_mul(&LAB_TO_LMS, &lab);
+    let lms = [
+        lms_[0].powi(3),
+        lms_[1].powi(3),
+        lms_[2].powi(3),
+    ];
+    let xyz = mat3_mul(&LMS_TO_XYZ, &lms);
+    mat3_mul(&XYZ_TO_RGB_MATRIX, &xyz)
+}
+
+/// Convert a flux-additive linear RGB colour to Oklab (`[L, a, b]`).
+///
+/// Inverse of [`oklab_to_linear_rgb`]. The cube root is applied with its sign
+/// so out-of-gamut / negative entries stay finite (matching the code's
+/// `signum * abs^pow`).
+pub(crate) fn linear_rgb_to_oklab(rgb: [f64; 3]) -> [f64; 3] {
+    let xyz = mat3_mul(&RGB_TO_XYZ_MATRIX, &rgb);
+    let lms = mat3_mul(&XYZ_TO_LMS, &xyz);
+    let lms_ = [
+        lms[0].signum() * lms[0].abs().cbrt(),
+        lms[1].signum() * lms[1].abs().cbrt(),
+        lms[2].signum() * lms[2].abs().cbrt(),
+    ];
+    mat3_mul(&LMS_TO_LAB, &lms_)
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::Zip;
@@ -329,5 +380,22 @@ mod tests {
         Zip::from(&result)
             .and(&expected)
             .for_each(|e, r| assert_delta!(e, r, 1e-5));
+    }
+
+    #[test]
+    fn test_oklab_linear_roundtrip() {
+        // A neutral (achromatic) colour must stay neutral through the linear
+        // space, and the round trip must recover the original Oklab values.
+        let grey = linear_rgb_to_oklab([0.18, 0.18, 0.18]);
+        assert!(grey[1].abs() < 1e-4, "grey should be achromatic, got a={}", grey[1]);
+        assert!(grey[2].abs() < 1e-4, "grey should be achromatic, got b={}", grey[2]);
+
+        for lab in [[0.7, 0.05, -0.08], [0.3, -0.04, 0.02], [0.85, 0.0, 0.1]] {
+            let rgb = oklab_to_linear_rgb(lab);
+            let back = linear_rgb_to_oklab(rgb);
+            assert_delta!(back[0], lab[0], 1e-6);
+            assert_delta!(back[1], lab[1], 1e-6);
+            assert_delta!(back[2], lab[2], 1e-6);
+        }
     }
 }

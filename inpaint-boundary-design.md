@@ -1,8 +1,8 @@
 # Inpaint boundary artifact — design & tracking notes
 
-Status: **RESET to accepted baseline `790ff1e`** (working tree clean; 29 Rust + 30
-Python tests pass). Approach A discarded as "demostrably worse". This file is a
-living design/tracking note for the next attempt. **Nothing here is committed.**
+Status: active. The accepted baseline and subsequent v1.1/v2 fixes are committed
+(`790ff1e`, `ea3ca17`, `a18d67c`)); this file is a tracked design/tracking note
+for ongoing work. Approach A was discarded as "demostrably worse".
 
 ---
 
@@ -195,11 +195,53 @@ High-frequency = mean |adjacent difference| over the masked-distance band
 | fill std / bg std | — | 0.002 / 0.0042 | match |
 
 ## 7. Current state
-- `HEAD` = `790ff1e` (accepted baseline); working tree has the uncommitted v2 fix
-  (v1.1 + no taper + no blend + no fill clamp). `data.npy`/`mask.npy` are local
-  test data; this note itself is an untracked file.
-- **Resolved:** the "frozen grainy rim" and the "flat homogeneous ring" were the
-  *same* defect, and its root cause was the fill's `.max(0)` clamp flooring
-  negatives (plus, secondarily, `lf == 0` in the mask before v1.1). With v1.1 +
-  no clamp, the existing operator reproduces the surrounding structure.
-- Next: full suite clean (28 Rust + 30 Python), final review, then commit.
+- `HEAD` = `a18d67c`; committed: `790ff1e` (accepted baseline), `ea3ca17` (v2: v1.1
+  mask-inclusive low-pass + drop taper/blend/fill clamp), `a18d67c` (radial_rise
+  + none init methods). `data.npy`/`lab_data.npy`/`mask.npy`/`recon.png` are local
+  test data (untracked); this note is now a tracked design note.
+- **Resolved:** the fill's `.max(0)` clamp flooring negatives (plus `lf == 0`
+  deep in the mask) made masked fills flat/homogeneous. With v1.1 + no clamp the
+  operator reproduces surrounding structure.
+
+## 8. Saturated-star brightness (L channel)
+The default `boundary_fill` init fills each masked pixel with the *local mean* of
+nearby unmasked pixels — a statistical continuation that produces a **flat**,
+too-faint fill for a saturated star (no bright core). Diffusion alone cannot
+invent a core because unmasked pixels are Dirichlet-fixed.
+
+Answer: control **initialization**. Added `init_method="radial_rise"` (plus
+`init_method="none"` to pre-seed from the caller), intended for the **L** channel
+of a Lab image; a/b keep `boundary_fill`.
+
+```text
+L(p) = L_base(p) + peak_amp * depth * ( (1-a)*(d/depth) + a*(d/depth)^2 ) ,  L >= 0
+```
+`L_base` = the value of the **nearest unmasked pixel** (via a multi-source BFS
+that propagates the boundary value inward). `depth` = max distance-to-boundary of
+the component (mask size); `d` = distance-to-edge of each masked pixel; `a` is
+internal (a=0.25). The lift is 0 at the edge so values stay contiguous, is
+monotonic to a brighter core, and `peak_amp * depth` makes **larger/deeper masks
+brighter** (`peak_amp` default 0.02 tunes core brightness). The squared term gives
+dome curvature; the **linear term gives nonzero slope at the seam** so the fill
+continues the surrounding star's radial gradient instead of a flat shoulder.
+
+Anchoring to the *nearest* boundary value (not a window/local mean, as in
+`boundary_fill`) is what removes the dark dip: on the steep wing of a star the
+window-averaged local mean under-shoots the true local level, producing a faint
+dip right after the border. Per-point nearest anchoring is exact at the seam.
+
+Measured on `lab_data.npy`/`mask.npy` (real diffusion, 20 iters, `peak_amp=0.02`):
+seam error vs nearest unmasked neighbor: mean 0.003, max 0.018 (contiguous, no
+step/dip).
+
+Post-diffusion L profile by depth band (d1..d24, `peak_amp=0.02`), monotonic:
+| depth | 1 | 4 | 8 | 12 | 16 | 20 | 24 |
+|---|---|---|---|---|---|---|---|
+| mean L | 0.360 | 0.386 | 0.443 | 0.489 | 0.556 | 0.646 | 0.735 |
+
+At `peak_amp` 0.015, 0.02, 0.025 the profile is monotonic increasing to the core
+in all 24 depth bands; `peak_amp` scales the core brightness (depth 24: 0.65, 0.74,
+0.82). An earlier global-median-anchored radial model produced a bright halo on
+the boundary sides that were darker than the median; the nearest-unmasked base
+fixes both the halo and the dip.
+

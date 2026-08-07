@@ -29,9 +29,11 @@ are permitted provided that the following conditions are met:
  */
 extern crate openblas_src;
 use log;
-use ndarray::{Array2, ArrayView2, ArrayViewMut2, NdFloat};
-use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
+use ndarray::{Array2, Array3, ArrayView2, ArrayViewMut2, NdFloat};
+use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use pyo3::prelude::*;
+use pyo3::exceptions::PyValueError;
+use crate::rgb::color_spaces::{linear_rgb_to_oklab, oklab_to_linear_rgb};
 use rand;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -599,6 +601,12 @@ fn equivalent_sigma_at_step<T: NdFloat + Default>(sigma: T, s: usize) -> T {
 /// Determines how many B-spline decomposition levels are needed
 /// to achieve a specified effective smoothing scale.
 ///
+/// The accumulated effective sigma follows the same squared-additive semantics
+/// as [`equivalent_sigma_at_step`]: each step adds the *square* `(2^s * sigma)^2`
+/// of the additional scale (not the linear `2^s * sigma`). Keeping the two
+/// functions consistent means the same `s` steps produce the same equivalent
+/// sigma in both.
+///
 /// # Arguments
 /// * `sigma_filter` - Base filter standard deviation
 /// * `sigma_final` - Target equivalent sigma
@@ -614,7 +622,7 @@ fn num_steps_to_reach_equivalent_sigma<T: NdFloat + Default>(
     let mut radius = sigma_filter;
     while radius < sigma_final {
         s += 1;
-        radius = (radius.powi(2) + T::from(1 << s).unwrap() * sigma_filter).sqrt();
+        radius = (radius.powi(2) + (T::from(1 << s).unwrap() * sigma_filter).powi(2)).sqrt();
     }
     s + 1
 }
@@ -1027,8 +1035,10 @@ pub fn diffuse_gray_image<'py>(
     radius: f64,
     sharpness: f64,
 ) -> Bound<'py, PyArray2<f64>> {
-    // TODO: revisit this interface to see if I strictly need this as mut
-    let mut array = unsafe { image.as_array_mut() };
+    // `image` is a read-only numpy array. Copy it into a mutable local Array2
+    // and run the diffusion on that copy, so we never mutate a
+    // PyReadonlyArray2 through `unsafe`.
+    let mut array = image.as_array().to_owned();
 
     let process_args = ProcessArgs {
         iterations,
@@ -1046,7 +1056,7 @@ pub fn diffuse_gray_image<'py>(
         radius,
         sharpness,
     };
-    let result = process_image(process_args, &mut array, None);
+    let result = process_image(process_args, &mut array.view_mut(), None);
     result.to_pyarray(py)
 }
 
@@ -1066,7 +1076,9 @@ pub fn diffuse_gray_image<'py>(
 ///
 /// # Panics
 /// Panics if any masked pixel has value <= 0, as this would make
-/// the standard deviation non-positive for Normal::new().
+/// the standard deviation non-positive for `Normal::new()`. Callers using
+/// `init_method="noise"` should validate via [`validate_noise_masked`] (which
+/// raises a `PyValueError`) before calling this.
 fn replace_masked_with_noise<T: NdFloat + Default>(
     image: ArrayView2<T>,
     mask: &ArrayView2<bool>,
@@ -1105,6 +1117,73 @@ struct Component {
     coords: Vec<(usize, usize)>,
 }
 
+/// 8-connected neighbour offsets (Chebyshev neighbourhood), shared by the
+/// component flood-fill and the nearest-value BFS.
+const NEIGHBORS: [(i32, i32); 8] = [
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+];
+
+/// Multi-source 8-connected BFS that fills every cell whose `dist == u32::MAX`
+/// with the value and (Chebyshev) distance of its nearest seed cell.
+///
+/// Callers pre-initialize `dist[(i, j)] = 0` and `values[(i, j)]` for the seed
+/// cells (e.g. unmasked pixels), then call this once to propagate the seed
+/// values inward. Cells with no reachable seed keep `dist == u32::MAX`.
+fn bfs_nearest_value<T: NdFloat + Default>(values: &mut Array2<T>, dist: &mut Array2<u32>) {
+    let (h, w) = dist.dim();
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    for i in 0..h {
+        for j in 0..w {
+            if dist[(i, j)] == 0 {
+                queue.push_back((i, j));
+            }
+        }
+    }
+    while let Some((ci, cj)) = queue.pop_front() {
+        let d = dist[(ci, cj)];
+        for (di, dj) in NEIGHBORS {
+            let ni = ci as i32 + di;
+            let nj = cj as i32 + dj;
+            if ni < 0 || nj < 0 || ni >= h as i32 || nj >= w as i32 {
+                continue;
+            }
+            let (ni, nj) = (ni as usize, nj as usize);
+            if dist[(ni, nj)] == u32::MAX {
+                dist[(ni, nj)] = d + 1;
+                values[(ni, nj)] = values[(ci, cj)];
+                queue.push_back((ni, nj));
+            }
+        }
+    }
+}
+
+/// Re-initialize a nearest-value BFS distance map for a fresh propagation.
+///
+/// Resets every cell to `u32::MAX` and marks each unmasked (seed) cell with
+/// distance 0, so a subsequent [`bfs_nearest_value`] starts from the same
+/// distance semantics every time. Call this before each channel's BFS so a
+/// previously populated `dist` is never reused as if it were unseeded (which
+/// would leave later channels unwarmed because their masked cells no longer
+/// hold `u32::MAX`).
+fn seed_nearest_dist(dist: &mut Array2<u32>, mask: &ArrayView2<bool>) {
+    let (h, w) = mask.dim();
+    dist.fill(u32::MAX);
+    for i in 0..h {
+        for j in 0..w {
+            if !mask[(i, j)] {
+                dist[(i, j)] = 0;
+            }
+        }
+    }
+}
+
 /// Find all 8-connected components of masked (True) pixels.
 ///
 /// Returns one `Component` per connected masked region including its tight
@@ -1133,21 +1212,16 @@ fn find_components(mask: &ArrayView2<bool>) -> Vec<Component> {
                 r1 = r1.max(ci);
                 c0 = c0.min(cj);
                 c1 = c1.max(cj);
-                for di in -1..=1i32 {
-                    for dj in -1..=1i32 {
-                        if di == 0 && dj == 0 {
-                            continue;
-                        }
-                        let ni = ci as i32 + di;
-                        let nj = cj as i32 + dj;
-                        if ni < 0 || nj < 0 || ni >= h as i32 || nj >= w as i32 {
-                            continue;
-                        }
-                        let (ni, nj) = (ni as usize, nj as usize);
-                        if mask[(ni, nj)] && !visited[(ni, nj)] {
-                            visited[(ni, nj)] = true;
-                            queue.push_back((ni, nj));
-                        }
+                for (di, dj) in NEIGHBORS {
+                    let ni = ci as i32 + di;
+                    let nj = cj as i32 + dj;
+                    if ni < 0 || nj < 0 || ni >= h as i32 || nj >= w as i32 {
+                        continue;
+                    }
+                    let (ni, nj) = (ni as usize, nj as usize);
+                    if mask[(ni, nj)] && !visited[(ni, nj)] {
+                        visited[(ni, nj)] = true;
+                        queue.push_back((ni, nj));
                     }
                 }
             }
@@ -1211,42 +1285,19 @@ fn fill_component<T: NdFloat + Default>(
     }
 
     // Multi-source BFS of the nearest unmasked value over the padded bbox.
-    let mut nearest = Array2::<Option<T>>::from_elem((sh, sw), None);
-    let mut dist = Array2::<usize>::from_elem((sh, sw), usize::MAX);
-    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut nearest = Array2::<T>::from_elem((sh, sw), T::default());
+    let mut dist = Array2::<u32>::from_elem((sh, sw), u32::MAX);
     for li in 0..sh {
         for lj in 0..sw {
             let gi = sr0 + li;
             let gj = sc0 + lj;
             if !mask[(gi, gj)] {
-                nearest[(li, lj)] = Some(image[(gi, gj)]);
+                nearest[(li, lj)] = image[(gi, gj)];
                 dist[(li, lj)] = 0;
-                queue.push_back((li, lj));
             }
         }
     }
-    while let Some((li, lj)) = queue.pop_front() {
-        let v = nearest[(li, lj)].unwrap();
-        let dd = dist[(li, lj)];
-        for di in -1..=1i32 {
-            for dj in -1..=1i32 {
-                if di == 0 && dj == 0 {
-                    continue;
-                }
-                let ni = li as i32 + di;
-                let nj = lj as i32 + dj;
-                if ni < 0 || nj < 0 || ni >= sh as i32 || nj >= sw as i32 {
-                    continue;
-                }
-                let (ni, nj) = (ni as usize, nj as usize);
-                if nearest[(ni, nj)].is_none() {
-                    nearest[(ni, nj)] = Some(v);
-                    dist[(ni, nj)] = dd + 1;
-                    queue.push_back((ni, nj));
-                }
-            }
-        }
-    }
+    bfs_nearest_value(&mut nearest, &mut dist);
 
     // Edge blend: scale down the added noise only for the outermost few pixels
     // so the fill blends seamlessly into the surroundings, ramping to full noise
@@ -1280,7 +1331,12 @@ fn fill_component<T: NdFloat + Default>(
             let var = (q / nn - m0 * m0).max(T::default());
             (m0, var.sqrt())
         } else {
-            (nearest[(li, lj)].unwrap_or(image[(i, j)]), eps)
+            let mean = if dist[(li, lj)] == u32::MAX {
+                image[(i, j)]
+            } else {
+                nearest[(li, lj)]
+            };
+            (mean, eps)
         };
         means.push(mean);
         sigmas.push(sigma);
@@ -1305,7 +1361,7 @@ fn fill_component<T: NdFloat + Default>(
         let lj = j - sc0;
         // Fraction of texture noise to keep, 0 at the boundary -> 1 away from it.
         let dd = dist[(li, lj)];
-        let keep = if dd == usize::MAX {
+        let keep = if dd == u32::MAX {
             T::from(1.0).unwrap()
         } else {
             let d = T::from(dd as f64).unwrap();
@@ -1374,6 +1430,332 @@ where
     result
 }
 
+/// Fill masked pixels with a radial stellar brightness profile.
+///
+/// Intended for the L (lightness) channel of a Lab image when reconstructing
+/// saturated stars, where the true core is brighter than the surrounding
+/// unsaturated wings but is hidden by the mask.
+///
+/// Seed = the value of the nearest unmasked pixel (so every masked pixel is
+/// contiguous with its local boundary value at the edge — no dip, no halo) plus
+/// a radial brightness lift growing toward the core:
+///
+/// ```text
+/// L(p) = nearest_unmasked_value(p) + peak * depth * ( (1-a)*(d'/depth') + a*(d'/depth')^2 )
+/// ```
+///
+/// where `d = distance_to_edge(p)` (8-connected Chebyshev distance) and `depth`
+/// is the maximum `d` over the component (how deep / how large the masked core
+/// is). The lift uses `d' = d - 1` and `depth' = depth - 1`, so the outermost
+/// masked pixels (`d = 1`) get zero lift and the fill is exactly contiguous
+/// with the surrounding value at the boundary; it then rises smoothly and
+/// monotonically to a brighter core. If a component has no reachable unmasked
+/// pixel (a fully-masked / no-boundary-data mask) the lift ramps are skipped and
+/// those pixels are left unchanged, instead of blowing up from the sentinel
+/// depth. Larger/deeper masks get a brighter core (`peak * depth`) — matching the
+/// rule that a bigger saturated area corresponds to a brighter star. `peak` is a
+/// tunable amplitude (signal per pixel of mask depth). The quadratic (squared)
+/// term gives the dome curvature / brighter core while the linear term gives a
+/// nonzero slope right at the seam (d'=0) so the fill continues the surrounding
+/// star's radial gradient instead of a flat shoulder.
+///
+/// Anchoring to the *nearest* boundary value (rather than a mean over a local
+/// window) is what removes the dark dip that a window-averaged base produces on
+/// a steep stellar wing. Only pixels outside the mask contribute to the base; the
+/// core brightness is set by the model. Used only for the L channel via
+/// `init_method="radial_rise"`; the a/b color channels keep `boundary_fill`.
+fn fill_masked_radial_rise<T: NdFloat + Default>(
+    image: ArrayView2<T>,
+    mask: &ArrayView2<bool>,
+    peak: T,
+) -> Array2<T> {
+    let (h, w) = image.dim();
+    let one = T::from(1.0).unwrap();
+    // Tuning knob: alpha=1 is a pure quadratic (zero initial seam slope),
+    // alpha=0 a pure cone (constant slope). A small value (~0.25) matches the
+    // outer wing gradient. Core brightness stays peak*depth for any alpha.
+    let a = T::from(0.25).unwrap();
+
+    // Multi-source BFS seeded at all unmasked pixels: propagate both the
+    // distance-to-edge and the value of the nearest unmasked pixel inward.
+    let mut result = image.to_owned();
+    let mut dist = Array2::<u32>::from_elem((h, w), u32::MAX);
+    for i in 0..h {
+        for j in 0..w {
+            if !mask[(i, j)] {
+                dist[(i, j)] = 0;
+            }
+        }
+    }
+    bfs_nearest_value(&mut result, &mut dist);
+
+    // Add the radial brightness lift, scaled per component by its depth. The
+    // ramp uses d-1 (not d), so the outermost masked pixels (d == 1) get zero
+    // lift and the fill is exactly contiguous with the surrounding value at the
+    // boundary.
+    for comp in find_components(mask) {
+        // Maximum Chebyshev distance-to-edge over the component.
+        let mut depth = 1u32;
+        for &(i, j) in &comp.coords {
+            depth = depth.max(dist[(i, j)]);
+        }
+        // No reachable unmasked pixel (all-masked / no boundary data): the
+        // sentinel u32::MAX remains and treating it as a depth would explode the
+        // lift (peak * 4.29e9). Leave those pixels unchanged — `result` already
+        // holds the original image value wherever no seed was reachable.
+        if depth == u32::MAX {
+            continue;
+        }
+        let depth_t = T::from(depth).unwrap();
+        let inv_depth = if depth > 1 {
+            T::from(1.0).unwrap() / T::from(depth - 1).unwrap()
+        } else {
+            T::from(1.0).unwrap()
+        };
+        for &(i, j) in &comp.coords {
+            let d = dist[(i, j)];
+            // d >= 1 for masked pixels; d-1 reaches 0 at the boundary and the
+            // deepest cell (d == depth) reaches 1, so core brightness stays
+            // peak*depth while the edge gets no lift.
+            let dnorm = if depth > 1 {
+                (T::from(d - 1).unwrap() * inv_depth).min(one)
+            } else {
+                T::default()
+            };
+            let lift = peak * depth_t * ((one - a) * dnorm + a * dnorm * dnorm);
+            let v = result[(i, j)] + lift;
+            result[(i, j)] = v.max(T::default());
+        }
+    }
+    result
+}
+
+/// Estimate the star's intrinsic colour for `comp` by integrating conserved
+/// per-band flux in linear RGB.
+///
+/// Explanation: for a telescope whose chromatic diffraction spikes are rotated /
+/// smeared into a starburst pattern (e.g. multi-exposure, rotating mount), the
+/// per-pixel `a`/`b` (and thus hue) is noise-chromatic and useless. But the
+/// misalignment only *redistributes* each band's light — it conserves total
+/// flux. So integrating the background-subtracted linear-RGB flux over a region
+/// that encloses the whole starburst recovers the star's intrinsic colour ratio.
+///
+/// The region is a disk of `radius` around the component centroid; the
+/// background is the median linear-RGB in the ring `[bg_inner, bg_outer]` around
+/// the same centre. Only unmasked pixels are used. Returns `None` if the
+/// integrated flux is too small to trust (faint star / dominated by noise).
+///
+/// This consumes a precomputed linear-RGB buffer (`lin`, shape (h, w, 3)) owned
+/// by the caller (materialised once per `reconstruct_star_color` call rather than
+/// once per component), instead of deriving linear RGB from Oklab here.
+fn estimate_star_linear_colour(
+    lin: &Array3<f64>,
+    mask: &ArrayView2<bool>,
+    comp: &Component,
+    radius: f64,
+    bg_inner: f64,
+    bg_outer: f64,
+) -> Option<[f64; 3]> {
+    let (h, w, _) = lin.dim();
+    let cy = comp.coords.iter().map(|&(i, _)| i as f64).sum::<f64>() / comp.coords.len() as f64;
+    let cx = comp.coords.iter().map(|&(_, j)| j as f64).sum::<f64>() / comp.coords.len() as f64;
+
+    let in_disk = |i: usize, j: usize| {
+        let dy = i as f64 - cy;
+        let dx = j as f64 - cx;
+        dy * dy + dx * dx <= radius * radius
+    };
+    let in_bg = |i: usize, j: usize| {
+        let dy = i as f64 - cy;
+        let dx = j as f64 - cx;
+        let d2 = dy * dy + dx * dx;
+        d2 >= bg_inner * bg_inner && d2 < bg_outer * bg_outer
+    };
+
+    // Background median linear RGB over the ring.
+    let mut bg_r: Vec<f64> = Vec::new();
+    let mut bg_g: Vec<f64> = Vec::new();
+    let mut bg_b: Vec<f64> = Vec::new();
+    for i in 0..h {
+        for j in 0..w {
+            if mask[(i, j)] || !in_bg(i, j) {
+                continue;
+            }
+            bg_r.push(lin[(i, j, 0)]);
+            bg_g.push(lin[(i, j, 1)]);
+            bg_b.push(lin[(i, j, 2)]);
+        }
+    }
+    let bg = if bg_r.is_empty() {
+        [0.0, 0.0, 0.0]
+    } else {
+        let p = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        [p(bg_r), p(bg_g), p(bg_b)]
+    };
+
+    // Integrated background-subtracted linear flux over the disk.
+    let mut s = [0.0f64; 3];
+    for i in 0..h {
+        for j in 0..w {
+            if mask[(i, j)] || !in_disk(i, j) {
+                continue;
+            }
+            s[0] += (lin[(i, j, 0)] - bg[0]).max(0.0);
+            s[1] += (lin[(i, j, 1)] - bg[1]).max(0.0);
+            s[2] += (lin[(i, j, 2)] - bg[2]).max(0.0);
+        }
+    }
+
+    // If the total flux is negligible the "colour" is just noise; refuse.
+    if s[0] + s[1] + s[2] < 1e-6 {
+        return None;
+    }
+    Some(s)
+}
+
+/// Build a sorted-by-L lookup curve `(L, a, b)` for light of fixed chromaticity
+/// `u` (a linear-RGB direction), i.e. colours `t * u` traced through Oklab.
+///
+/// Each point is a uniform-chromaticity colour; `L` is monotone in `t`, so the
+/// returned slice is sorted by `L` and can be searched for a target lightness.
+fn build_colour_curve(u: [f64; 3], l_min: f64, l_max: f64) -> Vec<[f64; 3]> {
+    let n = 512;
+    // Rough scan range in t; cover a wide range of brightness. The per-pixel
+    // query interpolates, so exact extent mostly just needs to bound L.
+    let t_min = 1e-9_f64;
+    let t_max = 1e3_f64;
+    let mut pts: Vec<[f64; 3]> = Vec::with_capacity(n);
+    for k in 0..n {
+        let t = t_min * (t_max / t_min).powf(k as f64 / (n as f64 - 1.0));
+        let rgb = [u[0] * t, u[1] * t, u[2] * t];
+        pts.push(linear_rgb_to_oklab(rgb));
+    }
+    // Keep only points spanning the queried L range to tighten the lookup.
+    let mut pts: Vec<[f64; 3]> = pts
+        .into_iter()
+        .filter(|p| p[0] >= l_min - 0.05 && p[0] <= l_max + 0.05)
+        .collect();
+    if pts.is_empty() {
+        pts.push(linear_rgb_to_oklab([u[0] * 0.001, u[1] * 0.001, u[2] * 0.001]));
+    }
+    pts.sort_by(|x, y| x[0].partial_cmp(&y[0]).unwrap_or(std::cmp::Ordering::Equal));
+    pts
+}
+
+/// Look up the `(a, b)` of the constant-chromaticity curve at lightness `lp`,
+/// linear-interpolating between the two bracketing samples.
+fn lookup_ab_curve(curve: &[[f64; 3]], lp: f64) -> [f64; 2] {
+    if curve.len() == 1 || lp <= curve[0][0] {
+        return [curve[0][1], curve[0][2]];
+    }
+    let last = curve[curve.len() - 1];
+    if lp >= last[0] {
+        return [last[1], last[2]];
+    }
+    // Binary search for the first point with L > lp.
+    let (mut lo, mut hi) = (0usize, curve.len() - 1);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if curve[mid][0] <= lp {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let (p0, p1) = (curve[lo], curve[hi]);
+    let f = (lp - p0[0]) / (p1[0] - p0[0]).max(1e-12);
+    [p0[1] + f * (p1[1] - p0[1]), p0[2] + f * (p1[2] - p0[2])]
+}
+
+/// Reconstruct the `a`/`b` channels of saturated stars.
+///
+/// See the `reconstruct_star_color` pyo3 wrapper for the full docstring. This
+/// fills each masked component with a constant-chromaticity colour: the colour
+/// is estimated by integrating conserved per-band linear-RGB flux, and each
+/// masked pixel's `(a, b)` is set from that colour at the pixel's reconstructed
+/// lightness `L`.
+fn fill_star_colour(
+    a_out: &mut Array2<f64>,
+    b_out: &mut Array2<f64>,
+    l_img: &ArrayView2<f64>,
+    a_img: &ArrayView2<f64>,
+    b_img: &ArrayView2<f64>,
+    lin: &Array3<f64>,
+    mask: &ArrayView2<bool>,
+    radius: f64,
+    bg_inner: f64,
+    bg_outer: f64,
+    blend: f64,
+) {
+    let (h, w) = mask.dim();
+
+    // Nearest-unmasked a/b values for the optional boundary blend. Each channel
+    // must be propagated from a freshly-seeded (identical) distance map; the
+    // first BFS populates `dist` with finite distances at masked cells, so it
+    // has to be re-seeded before the second channel's BFS, otherwise `near_b`
+    // would never be written and the b blend would fall back to the original
+    // saturated values.
+    let mut near_a = a_img.to_owned();
+    let mut near_b = b_img.to_owned();
+    let mut dist = Array2::<u32>::from_elem((h, w), u32::MAX);
+    seed_nearest_dist(&mut dist, mask);
+    bfs_nearest_value(&mut near_a, &mut dist);
+    seed_nearest_dist(&mut dist, mask);
+    bfs_nearest_value(&mut near_b, &mut dist);
+
+    for comp in find_components(mask) {
+        let Some(u) = estimate_star_linear_colour(lin, mask, &comp, radius, bg_inner, bg_outer)
+        else {
+            continue; // too faint / no signal: leave the masked pixels untouched
+        };
+        let mut l_min = f64::INFINITY;
+        let mut l_max = f64::NEG_INFINITY;
+        for &(i, j) in &comp.coords {
+            l_min = l_min.min(l_img[(i, j)]);
+            l_max = l_max.max(l_img[(i, j)]);
+        }
+        let curve = build_colour_curve(u, l_min, l_max);
+
+        for &(i, j) in &comp.coords {
+            let lp = l_img[(i, j)];
+            let [am, bm] = lookup_ab_curve(&curve, lp);
+            let dd = dist[(i, j)];
+            let w = if blend <= 0.0 {
+                1.0
+            } else {
+                let dd = dd as f64;
+                let uu = (dd / blend).min(1.0);
+                uu * uu * (3.0 - 2.0 * uu) // smoothstep: 0 at edge -> 1 inside
+            };
+            a_out[(i, j)] = w * am + (1.0 - w) * near_a[(i, j)];
+            b_out[(i, j)] = w * bm + (1.0 - w) * near_b[(i, j)];
+        }
+    }
+}
+
+/// Validate that every masked pixel has a positive value, as required by the
+/// `init_method="noise"` seeding (which uses the masked value both as the mean
+/// and the standard deviation of a Gaussian). Returns a `PyValueError` naming
+/// the offending pixel instead of panicking inside `Normal::new(...).unwrap()`.
+fn validate_noise_masked(image: ArrayView2<f64>, mask: &ArrayView2<bool>) -> PyResult<()> {
+    let (h, w) = mask.dim();
+    for i in 0..h {
+        for j in 0..w {
+            if mask[(i, j)] && image[(i, j)] <= 0.0 {
+                return Err(PyValueError::new_err(format!(
+                    "init_method='noise' requires all masked pixel values to be positive, \
+                     but masked pixel ({i}, {j}) has value {}",
+                    image[(i, j)]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inpaint masked regions in a grayscale image using anisotropic diffusion.
 ///
 /// First replaces masked regions with Gaussian noise (mean=original pixel
@@ -1393,14 +1775,22 @@ where
 ///     How masked pixels are initialized before diffusion. One of:
 ///
 ///     - ``"boundary_fill"`` (default): fill each masked pixel with the
-///       inverse-distance-weighted mean of unmasked neighbors within
-///       ``radius`` plus Gaussian noise whose standard deviation equals the
-///       local neighbor standard deviation (preserving realistic texture).
+///       equal-weight mean of unmasked neighbors within ``radius`` plus Gaussian
+///       noise whose standard deviation is a single robust (median) estimate of
+///       the surrounding texture (preserving realistic noise character).
 ///       Converges in far fewer iterations and tolerates negative values.
 ///     - ``"noise"``: the legacy behavior, filling each masked pixel with
 ///       Gaussian noise of mean and standard deviation equal to the original
 ///       pixel value. Simpler, but offers no convergence benefit and requires
 ///       positive pixel values.
+///     - ``"none"``: leave the masked pixels exactly as supplied in
+///       ``image`` (no re-fill). Use this to pre-seed the mask with your own
+///       model (e.g. a radial stellar brightness profile) before the
+///       diffusion refines it.
+///     - ``"radial_rise"``: seed the mask with a radial stellar brightness
+///       profile (higher in the core, brighter for larger/deeper masks,
+///       contiguous at the boundary). Use for the L channel when
+///       reconstructing saturated stars; see ``peak_amp``.
 /// iterations : `int`, optional
 ///     Number of diffusion iterations. Higher values produce more
 ///     complete inpainting. Default is 32.
@@ -1437,6 +1827,10 @@ where
 /// random_seed : `int`, optional
 ///     An optional positive int that is used to set the random seed. If
 ///     None, no seed will be set.
+/// peak_amp : `float`, optional
+///     Amplitude (in signal per pixel of mask depth) of the radial-rise core
+///     used by ``init_method="radial_rise"``. Larger values produce a brighter
+///     reconstructed star core. Ignored by other init methods. Default is 0.02.
 ///
 /// Notes
 /// -----
@@ -1485,7 +1879,8 @@ where
     radius= 5.0,
     sharpness= 0.0,
     random_seed = None,
-    init_method = "\"boundary_fill\""
+    init_method = "boundary_fill",
+    peak_amp = 0.02
 ))]
 pub fn inpaint_mask<'py>(
     py: Python<'py>,
@@ -1507,13 +1902,27 @@ pub fn inpaint_mask<'py>(
     sharpness: f64,
     random_seed: Option<u64>,
     init_method: &str,
-) -> Bound<'py, PyArray2<f64>> {
+    peak_amp: f64,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let array = image.as_array();
     let mask_array = mask.as_array();
     log::debug!(
         "Inpainting mask with {} pixels",
         mask_array.iter().fold(0, |acc, &b| acc + b as usize)
     );
+    if array.dim() != mask_array.dim() {
+        return Err(PyValueError::new_err(format!(
+            "image {:?} and mask {:?} must have the same dimensions",
+            array.dim(),
+            mask_array.dim()
+        )));
+    }
+    if !matches!(init_method, "noise" | "none" | "radial_rise" | "boundary_fill") {
+        return Err(PyValueError::new_err(format!(
+            "unsupported init_method {init_method:?}; expected one of \
+             \"noise\", \"none\", \"radial_rise\", \"boundary_fill\""
+        )));
+    }
 
     let process_args = ProcessArgs {
         iterations,
@@ -1533,7 +1942,19 @@ pub fn inpaint_mask<'py>(
     };
     let init_start = std::time::Instant::now();
     let mut masked = match init_method {
-        "noise" => replace_masked_with_noise(array, &mask_array, random_seed),
+        "noise" => {
+            validate_noise_masked(array, &mask_array)?;
+            replace_masked_with_noise(array, &mask_array, random_seed)
+        }
+        // "none": keep the caller-supplied masked values as the diffusion seed
+        // (no statistical re-fill). Lets an application pre-seed the mask with a
+        // model profile (e.g. a radial stellar PSF extrapolation) and then let
+        // the diffusion refine it while keeping the surrounding pixels fixed.
+        "none" => array.to_owned(),
+        // "radial_rise": seed the mask with a radial stellar brightness profile
+        // for saturated-star reconstruction (typically the L channel). Brighter
+        // cores for larger/deeper masks, contiguous at the boundary.
+        "radial_rise" => fill_masked_radial_rise(array, &mask_array, peak_amp),
         _ => fill_masked_from_boundary(array, &mask_array, radius.max(1.0) as usize, random_seed),
     };
     let init_elapsed = init_start.elapsed();
@@ -1542,7 +1963,7 @@ pub fn inpaint_mask<'py>(
     let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
     let diff_elapsed = diff_start.elapsed();
 
-    println!(
+    log::debug!(
         "[inpaint_mask] init_method={} radius={} init={:.3?} diffusion={:.3?} total={:.3?}",
         init_method,
         radius,
@@ -1551,7 +1972,173 @@ pub fn inpaint_mask<'py>(
         init_elapsed + diff_elapsed
     );
 
-    result.to_pyarray(py)
+    Ok(result.to_pyarray(py))
+}
+
+/// Reconstruct the `a`/`b` colour channels of saturated stars (Oklab image).
+///
+/// Parameters
+/// ----------
+/// L : `NDArray`
+///     Lightness channel (2D float64). Should be the *reconstructed* L from
+///     `inpaint_mask(..., init_method="radial_rise")`, since the masked core is
+///     what gets displayed and its lightness drives the colour lookup.
+/// a, b : `NDArray`
+///     The original a and b channels of the Oklab image (2D float64).
+/// mask : `NDArray`
+///     Boolean mask where True marks the saturated star cores to reconstruct.
+/// linear_rgb : `NDArray`, optional
+///     Precomputed linear-RGB image cube of shape (h, w, 3) with channels in RGB
+///     order, holding the raw linear float data that was fed to `RGB_to_Oklab`
+///     with the DEFAULT D65 illuminant (so it is in the crate's D65 working
+///     space). When supplied, it is used directly for the per-band flux
+///     integration that estimates each star's colour, instead of re-deriving
+///     linear RGB from the L/a/b arrays. When `None` (default), linear RGB is
+///     derived once from L/a/b.
+/// radius : `float`, optional
+///     Outer radius (px) of the disk around each star over which per-band
+///     linear flux is integrated to estimate the star's colour. Must enclose the
+///     whole chromatic-spike / starburst pattern. Default is 90.0.
+/// bg_inner : `float`, optional
+///     Inner radius (px) of the background ring used for sky subtraction.
+///     Default is 200.0.
+/// bg_outer : `float`, optional
+///     Outer radius (px) of the background ring. Default is 300.0.
+/// blend : `float`, optional
+///     Width (px) over which the reconstructed colour is blended toward the
+///     nearest unmasked pixel at the mask boundary, for a seamless seam. 0
+///     disables blending. Default is 2.0.
+///
+/// Returns
+/// -------
+/// (a, b) : tuple of `NDArray`
+///     Two float64 arrays, the reconstructed a and b channels (masked pixels
+///     filled; unmasked pixels unchanged). Components too faint to estimate a
+///     colour are left with their original masked values.
+///
+/// Raises
+/// ------
+/// `ValueError`
+///     If L, a, b, or mask shapes do not all match.
+/// `ValueError`
+///     If `linear_rgb` is provided but is not (h, w, 3) matching L/a/b/mask, or
+///     contains NaN/inf.
+///
+/// Notes
+/// -----
+/// This does NOT run the structural diffusion operator on a/b. The presence of
+/// chromatic diffraction spikes (rotated between bands, or smeared by multiple
+/// exposures) means that per-pixel a/b hue is noise-chromatic and that letting a
+/// structural fill reproduce boundary chroma would scatter the spikes into the
+/// reconstructed core. Instead the star's colour is estimated in a
+/// flux-additive (linear-RGB) space — integrated per-band flux is conserved
+/// under spike misalignment — and each masked pixel is painted with that single
+/// colour at its own reconstructed lightness. The Oklab convention used here is
+/// the library's D65 default; pass data produced with the same convention. In
+/// particular, when supplying `linear_rgb` it must be in the crate's D65 working
+/// space: providing data in a different whitepoint space biases the result.
+#[pyfunction]
+#[allow(non_snake_case)]
+#[pyo3(signature = (L, a, b, mask, linear_rgb=None, radius=90.0, bg_inner=200.0, bg_outer=300.0, blend=2.0))]
+pub fn reconstruct_star_color<'py>(
+    py: Python<'py>,
+    L: PyReadonlyArray2<f64>,
+    a: PyReadonlyArray2<f64>,
+    b: PyReadonlyArray2<f64>,
+    mask: PyReadonlyArray2<bool>,
+    linear_rgb: Option<PyReadonlyArray3<f64>>,
+    radius: f64,
+    bg_inner: f64,
+    bg_outer: f64,
+    blend: f64,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
+    let l_img = L.as_array();
+    let a_img = a.as_array();
+    let b_img = b.as_array();
+    let mask_array = mask.as_array();
+    let (h, w) = l_img.dim();
+    let (ah, aw) = a_img.dim();
+    let (bh, bw) = b_img.dim();
+    let (mh, mw) = mask_array.dim();
+    if (ah, aw) != (h, w) || (bh, bw) != (h, w) || (mh, mw) != (h, w) {
+        return Err(PyValueError::new_err(format!(
+            "L({h}x{w}), a({ah}x{aw}), b({bh}x{bw}), mask({mh}x{mw}) shapes must match"
+        )));
+    }
+    // Validate the geometry parameters: all finite, positive, and strictly
+    // ordered. NaN comparisons are false so NaN would slip past a bare
+    // `radius < bg_inner` check, hence the explicit is_finite() rejection.
+    if !(radius.is_finite() && bg_inner.is_finite() && bg_outer.is_finite()) {
+        return Err(PyValueError::new_err(
+            "radius, bg_inner, and bg_outer must all be finite (rejecting NaN/inf)",
+        ));
+    }
+    if radius <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "radius ({radius}) must be positive"
+        )));
+    }
+    if bg_inner <= radius {
+        return Err(PyValueError::new_err(format!(
+            "bg_inner ({bg_inner}) must be greater than radius ({radius})"
+        )));
+    }
+    if bg_outer <= bg_inner {
+        return Err(PyValueError::new_err(format!(
+            "bg_outer ({bg_outer}) must be greater than bg_inner ({bg_inner})"
+        )));
+    }
+
+    // Build the shared linear-RGB buffer once per call (per pixel), so the
+    // flux integration per component reuses it instead of re-converting.
+    let mut lin: Array3<f64>;
+    if let Some(cube) = linear_rgb {
+        let (ch, cw, cc) = cube.as_array().dim();
+        if cc != 3 {
+            return Err(PyValueError::new_err(format!(
+                "linear_rgb must have exactly 3 channels (R,G,B) along the last axis; got {cc}"
+            )));
+        }
+        if (ch, cw) != (h, w) {
+            return Err(PyValueError::new_err(format!(
+                "linear_rgb shape ({ch}x{cw}x{cc}) must match L/a/b/mask shape ({h}x{w})"
+            )));
+        }
+        if cube.as_array().iter().any(|&x| !x.is_finite()) {
+            return Err(PyValueError::new_err(
+                "linear_rgb must be finite (rejecting NaN/inf)",
+            ));
+        }
+        lin = cube.as_array().to_owned();
+    } else {
+        lin = Array3::<f64>::zeros((h, w, 3));
+        for i in 0..h {
+            for j in 0..w {
+                let [r, g, b] = oklab_to_linear_rgb([l_img[(i, j)], a_img[(i, j)], b_img[(i, j)]]);
+                lin[[i, j, 0]] = r;
+                lin[[i, j, 1]] = g;
+                lin[[i, j, 2]] = b;
+            }
+        }
+    }
+
+    let mut a_out = a_img.to_owned();
+    let mut b_out = b_img.to_owned();
+    fill_star_colour(
+        &mut a_out,
+        &mut b_out,
+        &l_img,
+        &a_img,
+        &b_img,
+        &lin,
+        &mask_array,
+        radius,
+        bg_inner,
+        bg_outer,
+        blend,
+    );
+
+    Ok((a_out.to_pyarray(py), b_out.to_pyarray(py)))
 }
 
 #[cfg(test)]
@@ -1918,6 +2505,108 @@ mod tests {
 
         let filled = fill_masked_from_boundary(img.view(), &mask.view(), 1, Some(4));
         assert_delta!(filled[(7, 7)], 3.0, 1e-3);
+    }
+
+    #[test]
+    fn test_radial_rise_monotonic_contiguous() {
+        // A uniform 0.4 field with a 5x5 square mask. radial_rise must be
+        // brighter toward the (deepest) center, match the boundary (0.4) exactly
+        // at the very edge (d == 1 gives zero lift with the d-1 ramp), and stay
+        // non-negative.
+        let img = Array2::<f64>::from_elem((15, 15), 0.4);
+        let mut mask = Array2::<bool>::from_elem((15, 15), false);
+        for r in 5..=9 {
+            for c in 5..=9 {
+                mask[(r, c)] = true;
+            }
+        }
+        let filled = fill_masked_radial_rise(img.view(), &mask.view(), 0.02);
+
+        let center = filled[(7, 7)];
+        let edge = filled[(5, 5)];
+        assert!(center > edge, "center {} should be brighter than edge {}", center, edge);
+        assert!(filled.iter().all(|&v| v >= 0.0));
+        // Edge (d == 1) gets zero lift: it must equal the 0.4 boundary exactly.
+        assert_delta!(edge, 0.4, 1e-12);
+        // The lift ramps in one pixel: the cell one step inside the boundary
+        // (row 6) is already brighter than the edge.
+        assert!(filled[(6, 6)] > edge, "fill should ramp to brightness just inside the edge");
+    }
+
+    #[test]
+    fn test_radial_rise_fully_masked_stays_finite() {
+        // A fully-masked image has no unmasked seed, so every dist stays u32::MAX.
+        // The depth sentinel must NOT explode the lift: the fill must remain the
+        // original (finite, reasonable) values rather than peak * 4.29e9.
+        let img = Array2::<f64>::from_elem((10, 10), 0.4);
+        let mask = Array2::<bool>::from_elem((10, 10), true);
+
+        let filled = fill_masked_radial_rise(img.view(), &mask.view(), 0.02);
+        assert!(filled.iter().all(|&v| v.is_finite()));
+        assert!(filled.iter().all(|&v| (v - 0.4).abs() < 1e-12),
+            "fully-masked radial_rise must leave pixels unchanged, got non-uniform fill");
+    }
+
+    #[test]
+    fn test_bfs_nearest_value_propagates_chebyshev() {
+        // Seeds are marked with dist == 0; unseeded cells get the nearest seed
+        // value and an 8-connected (Chebyshev) distance.
+        let mut values = Array2::<f64>::from_elem((3, 3), 0.0);
+        let mut dist = Array2::<u32>::from_elem((3, 3), u32::MAX);
+        values[(0, 0)] = 7.0;
+        dist[(0, 0)] = 0; // single seed at the corner
+        bfs_nearest_value(&mut values, &mut dist);
+
+        // All cells reachable, holding the seed value.
+        assert!(dist.iter().all(|&d| d != u32::MAX));
+        assert!(values.iter().all(|&v| v == 7.0));
+        // Chebyshev distance grows by 1 per step, so (2,2) is 2 away.
+        assert_eq!(dist[(2, 2)], 2);
+        assert_eq!(dist[(0, 2)], 2);
+
+        // An isolated second seed: DBZ... nearest source decides which wins.
+        let mut v2 = Array2::<f64>::from_elem((3, 3), 0.0);
+        let mut d2 = Array2::<u32>::from_elem((3, 3), u32::MAX);
+        v2[(0, 0)] = 1.0;
+        v2[(2, 2)] = 9.0;
+        d2[(0, 0)] = 0;
+        d2[(2, 2)] = 0;
+        bfs_nearest_value(&mut v2, &mut d2);
+        // Tie point (1,1) takes whichever seed was relaxed first (origin seed).
+        assert!((v2[(1, 1)] - 1.0).abs() < 1e-12 || (v2[(1, 1)] - 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_star_colour_curve_is_hue_stable() {
+        // A uniform-chromaticity curve must have a single hue (constant a/b
+        // direction) across all lightnesses, and lightness must be monotone.
+        // Use a bluish chromaticity: more blue than red in linear RGB.
+        let u = [0.8, 1.0, 1.2];
+        let curve = build_colour_curve(u, 0.0, 1.0);
+        let hue0 = curve[0][2].atan2(curve[0][1]);
+        for p in curve.iter() {
+            let hue = p[2].atan2(p[1]);
+            let _ = (p[0], hue); // hue consistency checked below
+            let delta = (hue - hue0).abs().min((hue - hue0 + std::f64::consts::TAU).abs())
+                .min((hue0 - hue + std::f64::consts::TAU).abs());
+            assert!(delta < 1e-1, "hue should be ~stable on a constant-chromaticity curve");
+        }
+        // Monotone L.
+        for w in curve.windows(2) {
+            assert!(w[1][0] >= w[0][0] - 1e-9, "L must be monotone on the curve");
+        }
+    }
+
+    #[test]
+    fn test_lookup_ab_curve_interpolates() {
+        // Build a curve from a neutral chromaticity: (a, b) ~ 0 for all L, so a
+        // lookup returns ~achromatic values whatever the target lightness.
+        let curve = build_colour_curve([1.0, 1.0, 1.0], 0.1, 0.9);
+        for lp in [0.15, 0.3, 0.5, 0.75] {
+            let ab = lookup_ab_curve(&curve, lp);
+            assert!(ab[0].abs() < 1e-4, "neutral star should stay achromatic, got a={}", ab[0]);
+            assert!(ab[1].abs() < 1e-4, "neutral star should stay achromatic, got b={}", ab[1]);
+        }
     }
 
 }

@@ -158,12 +158,14 @@ class DiffusionTestCase(TestCase):
         np.testing.assert_allclose(right_mean, 0.7, atol=0.1)
 
     def test_inpaint_no_boundary_overshoot_ring(self):
-        """The hf-sharpening taper (2b) removes the boundary overshoot/dip ring.
+        """The masked fill must not exhibit a boundary overshoot/dip ring.
 
-        A constant image with a rectangular mask must not exhibit a boundary
+        A constant image with a rectangular mask must not show a boundary
         ring or two-pixel bright/dark dipole (values rising above then dipping
         below the background) that the fourth-order diffusion term would
         otherwise amplify from the decomposition step at the mask edge.
+        The mask-inclusive low-pass (v1.1) plus the un-clamped masked fill
+        prevent that ring.
         """
         test_image = np.ones((60, 60), dtype=np.float64) * 0.5
         mask = np.zeros((60, 60), dtype=bool)
@@ -252,11 +254,13 @@ class DiffusionTestCase(TestCase):
         self.assertLess(result_large[25, 25], result_small[25, 25])
 
     def test_inpaint_mask_decomposition_no_contamination(self):
-        """The mask-aware decomposition should prevent masked-region values
-        from contaminating HF components at nearby unmasked pixels.
+        """The mask-inclusive low-pass must not contaminate unmasked pixels.
 
-        Uses a constant image with a distinctive masked region value.
-        Unmasked pixels just outside the mask should NOT be altered.
+        The decomposition now includes every pixel (masked and unmasked) in the
+        low-pass so `lf` spans the mask, while the exact reconstruction
+        `output = hf + lf = input` still holds at unmasked pixels. An extreme
+        value inside the mask must therefore NOT alter unmasked pixels outside
+        it (nor leak through the boundary).
         """
         # Constant image with a block of different value in the mask
         test_image = np.ones((30, 30), dtype=np.float64) * 10.0
@@ -276,16 +280,16 @@ class DiffusionTestCase(TestCase):
             result[0:8, 0:8], test_image[0:8, 0:8], atol=1e-10
         )
 
-        # Unmasked pixels where the B-spline filter crosses the mask boundary
-        # should also be preserved (the mask-aware decomposition excludes
-        # masked neighbors from the filter).
+        # Unmasked pixels near the mask boundary should also be preserved exactly
+        # via the exact hf+lf reconstruction, even though the B-spline filter
+        # crosses the mask (its masked values are allowed into the low-pass).
         # Position (9, 15): unmasked, but vertical filter at row 9 includes
-        #   rows 10,11 which ARE masked → with fix, those are excluded
+        #   rows 10,11 which ARE masked.
         np.testing.assert_allclose(
             result[9, 15], test_image[9, 15], atol=1e-6,
         )
         # Position (15, 9): unmasked, but horizontal filter at col 9 includes
-        #   cols 10,11 which ARE masked → with fix, those are excluded
+        #   cols 10,11 which ARE masked.
         np.testing.assert_allclose(
             result[15, 9], test_image[15, 9], atol=1e-6,
         )
@@ -295,8 +299,8 @@ class DiffusionTestCase(TestCase):
 
     def test_inpaint_saturated_star_ab_channel(self):
         """Simulate a saturated star in the a/b channel: extreme values
-        in the mask that should not contaminate the decomposition of
-        surrounding pixels.
+        in the mask that should not leak into / contaminate pixels around a
+        masked saturated core, even though the low-pass includes masked pixels.
         """
         np.random.seed(42)
         # Background with smooth gradient (offset to non-negative)
@@ -441,6 +445,169 @@ class DiffusionTestCase(TestCase):
 
         self.assertTrue(np.isfinite(np.array(results)).all())
         self.assertLess(np.abs(np.array(results) - 0.5).max(), 0.2)
+
+    def test_inpaint_radial_rise_brightness_profile(self):
+        """init_method='radial_rise' seeds the mask with a radial brightness
+        profile: brighter in the deep center than at the edge, monotonic rise,
+        and contiguous with the surrounding value at the boundary."""
+        test_image = np.ones((60, 60), dtype=np.float64) * 0.1
+        mask = np.zeros((60, 60), dtype=bool)
+        mask[20:40, 20:40] = True  # large/deep square mask
+        test_image[10:50, 10:50] = 0.4
+
+        deep = rgb.inpaint_mask(
+            test_image, mask, iterations=5, random_seed=1,
+            init_method="radial_rise", peak_amp=0.02,
+        )
+
+        from scipy import ndimage
+        d = ndimage.distance_transform_edt(mask)
+        center = (d == d.max())
+        edge = mask & (d <= 1)
+        outside = ~mask & ndimage.binary_dilation(mask, iterations=1)
+
+        self.assertTrue(np.isfinite(deep[mask]).all())
+        # monotonic: center brighter than edge; edge contiguous with the boundary
+        self.assertGreater(deep[center].mean(), deep[edge].mean())
+        self.assertLess(abs(deep[edge].mean() - deep[outside].mean()), 0.05)
+
+    def test_reconstruct_star_color_fills_star_color(self):
+        """reconstruct_star_color fills a masked star core with the star's own
+        colour (estimated by integrating per-band flux), leaving unmasked pixels
+        untouched."""
+        L = np.full((80, 80), 0.1)
+        a = np.zeros((80, 80))
+        b = np.zeros((80, 80))
+        y, x = np.ogrid[:80, :80]
+        r = np.hypot(y - 40, x - 40)
+        star = r <= 15.0
+        L[star] = 0.6
+        a[star] = 0.12
+        b[star] = -0.25
+        mask = r <= 8.0  # saturate / mask the star core
+
+        new_a, new_b = rgb.reconstruct_star_color(
+            L.copy(), a, b, mask, radius=18.0, bg_inner=20.0, bg_outer=30.0, blend=0.0
+        )
+
+        # Masked core is filled with the star colour (not the saturated values).
+        np.testing.assert_allclose(new_a[mask], 0.12, atol=0.05)
+        np.testing.assert_allclose(new_b[mask], -0.25, atol=0.05)
+        # Unmasked pixels are unchanged.
+        np.testing.assert_allclose(new_a[~mask], a[~mask], atol=1e-12)
+        np.testing.assert_allclose(new_b[~mask], b[~mask], atol=1e-12)
+
+    def test_reconstruct_star_color_blend_pulls_both_channels_to_boundary(self):
+        """With a nonzero blend, masked-pixel a AND b at the mask boundary must
+        both be pulled toward the surrounding unmasked values (not toward the
+        saturated core values). This locks in correct b-channel nearest-value
+        propagation: previously the BFS distance map was only re-seeded for the a
+        channel, so near_b was never written and the b blend never moved."""
+        L = np.full((80, 80), 0.1)
+        a = np.zeros((80, 80))
+        b = np.zeros((80, 80))
+        y, x = np.mgrid[:80, :80]
+        r = np.hypot(y - 40, x - 40)
+        star = r <= 18.0
+        L[star] = 0.6
+        a[star] = 0.10  # star wings: chromatic colour used for the flux estimate
+        b[star] = -0.25
+        mask = r <= 8.0
+        # Saturate the masked core with extreme, wrong a/b values.
+        a[mask] = 0.9
+        b[mask] = 0.9
+
+        new_a, new_b = rgb.reconstruct_star_color(
+            L, a, b, mask, radius=18.0, bg_inner=20.0, bg_outer=30.0, blend=2.0
+        )
+
+        from scipy import ndimage
+        boundary = mask & ~ndimage.binary_erosion(mask)
+        self.assertGreater(boundary.sum(), 0)
+
+        # Boundary masked pixels must approach the surrounding unmasked colour
+        # (a=0.10, b=-0.25) in BOTH channels, not the saturated core (0.9).
+        np.testing.assert_allclose(new_a[boundary], 0.10, atol=0.1)
+        np.testing.assert_allclose(new_b[boundary], -0.25, atol=0.1)
+
+        # The deep interior is fully blended to the reconstructed star colour.
+        interior = mask & ndimage.binary_erosion(ndimage.binary_erosion(mask))
+        self.assertGreater(interior.sum(), 0)
+        np.testing.assert_allclose(new_a[interior], 0.10, atol=0.1)
+        np.testing.assert_allclose(new_b[interior], -0.25, atol=0.1)
+
+    def test_reconstruct_star_color_linear_rgb_matches_fallback(self):
+        """Supplying a precomputed linear-RGB cube directly must give the same
+        result as the default Oklab-to-linear-RGB fallback (the cube is used
+        directly for flux integration instead of being re-derived)."""
+        size = 80
+        cube = np.full((size, size, 3), 0.10, dtype=np.float64)
+        y, x = np.ogrid[:size, :size]
+        r = np.hypot(y - size // 2, x - size // 2)
+        star = r <= 18.0
+        cube[star, 0] = 0.80
+        cube[star, 1] = 0.45
+        cube[star, 2] = 0.30
+        mask = r <= 8.0
+
+        # Derive the Oklab L/a/b from the linear-RGB cube with the D65 default.
+        lab = rgb.RGB_to_Oklab(cube, (0.31272, 0.32903))
+        L = lab[:, :, 0]
+        a = lab[:, :, 1]
+        b = lab[:, :, 2]
+
+        kwargs = dict(radius=18.0, bg_inner=20.0, bg_outer=30.0, blend=0.0)
+
+        a_fallback, b_fallback = rgb.reconstruct_star_color(L.copy(), a, b, mask, **kwargs)
+        a_cube, b_cube = rgb.reconstruct_star_color(
+            L.copy(), a, b, mask, linear_rgb=cube, **kwargs
+        )
+
+        np.testing.assert_allclose(a_cube, a_fallback, atol=1e-6)
+        np.testing.assert_allclose(b_cube, b_fallback, atol=1e-6)
+
+        # Sanity: the cube path actually filled the mask with the star's
+        # chromatic values (in Oklab space the a/b of the 0.80/0.45/0.30 core).
+        star_lab_a = a[star].mean()
+        star_lab_b = b[star].mean()
+        np.testing.assert_allclose(a_cube[mask], star_lab_a, atol=0.1)
+        np.testing.assert_allclose(b_cube[mask], star_lab_b, atol=0.1)
+
+    def test_reconstruct_star_color_linear_rgb_wrong_shape_raises(self):
+        """A provided linear_rgb cube with the wrong shape or NaN/inf contents
+        must raise ValueError."""
+        size = 80
+        L = np.full((size, size), 0.1)
+        a = np.zeros((size, size))
+        b = np.zeros((size, size))
+        mask = np.zeros((size, size), dtype=bool)
+        mask[size // 2, size // 2] = True
+        kwargs = dict(radius=18.0, bg_inner=20.0, bg_outer=30.0, blend=0.0)
+
+        # Wrong number of channels.
+        with self.assertRaises(ValueError):
+            rgb.reconstruct_star_color(
+                L, a, b, mask, linear_rgb=np.zeros((size, size, 2)), **kwargs
+            )
+
+        # Wrong spatial shape (channels correct).
+        with self.assertRaises(ValueError):
+            rgb.reconstruct_star_color(
+                L, a, b, mask, linear_rgb=np.zeros((size - 5, size, 3)), **kwargs
+            )
+
+        # Non-finite contents.
+        nan_cube = np.full((size, size, 3), np.nan)
+        with self.assertRaises(ValueError):
+            rgb.reconstruct_star_color(L, a, b, mask, linear_rgb=nan_cube, **kwargs)
+
+    def test_inpaint_mask_shape_mismatch_raises(self):
+        """inpaint_mask must raise ValueError when image and mask shapes differ,
+        rather than crashing with an out-of-bounds index."""
+        image = np.ones((20, 20), dtype=np.float64)
+        mask = np.ones((15, 15), dtype=bool)  # wrong shape
+        with self.assertRaises(ValueError):
+            rgb.inpaint_mask(image, mask, iterations=5)
 
 
 class MemoryTestCase(MemoryTestCase):
