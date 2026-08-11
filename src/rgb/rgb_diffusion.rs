@@ -43,6 +43,7 @@ use std::collections::VecDeque;
 
 const MAX_NUM_SCALES: usize = 10;
 const B_SPLINE_SIGMA: f64 = 2.0553651328015339;
+const B_SPLINE_FILTER_F64: [f64; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 const H: usize = 1;
 const KAPPA: f64 = 0.25;
 
@@ -243,10 +244,165 @@ fn compute_kernel<T: NdFloat + Default>(
 /// * `abcd` - Four diffusion coefficients weighted by position
 /// * `strength` - Overall diffusion strength multiplier
 /// * `mask` - Optional boolean mask for selective pixel processing
+/// * `scoped` - Optional linear indices (row-major, idx=r*width+c) of the cells
+///   to process for the current scale (`masked ∪ read-halo`). `Some` scopes the
+///   loop to just those cells instead of the full image; `None` falls back to
+///   the full-image loop (exactly preserving the legacy mask=None and
+///   full-scan-masked behavior). The heavy masked branch and the unmasked
+///   `hf + lf` passthrough are shared by both paths, so the two produce
+///   identical numerics for the cells they have in common.
 ///
 /// # Notes
 /// The diffusion coefficient computation: c = exp(-|∇u| * anisotropy)
 /// ensures edge preservation: high gradient = low diffusion.
+///
+/// Shared per-pixel heavy-branch worker for [`heat_pde_diffusion`], written so
+/// it `#[inline(always)]` into both the full-scan and the scoped loops, keeping
+/// the exact same expression ordering (hence bit-identical numerics) across
+/// paths while avoiding per-pixel closure/indirection overhead. `clip` selects
+/// the legacy mask=None clamp; the masked-fill path (`clip == false`) leaves
+/// values unclipped.
+#[inline(always)]
+fn diffusion_compute<T: NdFloat + Default>(
+    hf_input: ArrayView2<T>,
+    lf_input: ArrayView2<T>,
+    row: usize,
+    col: usize,
+    mult: usize,
+    height: usize,
+    width: usize,
+    anisotropy: [T; 4],
+    isotropy_type: [IsotropyType; 4],
+    variance_threshold: T,
+    regularization_factor: T,
+    abcd: [T; 4],
+    strength: T,
+    clip: bool,
+) -> T {
+    let mut i_neighbours: [usize; 3] = [0, 0, 0];
+    let mut j_neighbours: [usize; 3] = [0, 0, 0];
+    let mut neighbour_pixel_hf = [T::default(); 9];
+    let mut neighbour_pixel_lf = [T::default(); 9];
+    let mut c2 = [T::default(); 4];
+
+    i_neighbours[0] = (cmp::max(row as i32 - (mult * H) as i32, 0) as i32) as usize;
+    i_neighbours[1] = row;
+    i_neighbours[2] = cmp::min((row + mult * H) as i32, height as i32 - 1) as usize;
+    j_neighbours[0] = cmp::max(col as i32 - (mult * H) as i32, 0) as usize;
+    j_neighbours[1] = col;
+    j_neighbours[2] = cmp::min((col + mult * H) as i32, width as i32 - 1) as usize;
+
+    for ii in 0..3 {
+        for jj in 0..3 {
+            neighbour_pixel_hf[3 * ii + jj] =
+                hf_input[(i_neighbours[ii], j_neighbours[jj])];
+            neighbour_pixel_lf[3 * ii + jj] =
+                lf_input[(i_neighbours[ii], j_neighbours[jj])];
+        }
+    }
+
+    let mut gradient = find_gradients(Flat3Matrix(neighbour_pixel_lf));
+    let mut laplace = find_gradients(Flat3Matrix(neighbour_pixel_hf));
+
+    let magnitude_grad = (gradient[0].powi(2) + gradient[1].powi(2)).sqrt();
+    c2[0] = -magnitude_grad * anisotropy[0];
+    c2[2] = -magnitude_grad * anisotropy[2];
+
+    if magnitude_grad != T::default() {
+        gradient[0] /= magnitude_grad;
+        gradient[1] /= magnitude_grad;
+    } else {
+        gradient[0] = T::from(1.0).unwrap();
+        gradient[1] = T::default();
+    }
+    let cos_theta_grad_sq = gradient[0].powi(2);
+    let sin_theta_grad_sq = gradient[1].powi(2);
+    let cos_theta_sin_theta_grad = gradient[0] * gradient[1];
+
+    let magnitude_lapl = (laplace[0].powi(2) + laplace[1].powi(2)).sqrt();
+    c2[1] = -magnitude_lapl * anisotropy[1];
+    c2[3] = -magnitude_lapl * anisotropy[3];
+
+    if magnitude_lapl != T::default() {
+        laplace[0] /= magnitude_lapl;
+        laplace[1] /= magnitude_lapl;
+    } else {
+        laplace[0] = T::from(1.0).unwrap();
+        laplace[1] = T::default();
+    }
+
+    let cos_theta_lapl_sq = laplace[0].powi(2);
+    let sin_theta_lapl_sq = laplace[1].powi(2);
+    let cos_theta_sin_theta_lapl = laplace[0] * laplace[1];
+
+    for k in 0..4 {
+        c2[k] = c2[k].exp();
+    }
+    let kern_first = compute_kernel(
+        c2[0],
+        cos_theta_sin_theta_grad,
+        cos_theta_grad_sq,
+        sin_theta_grad_sq,
+        &isotropy_type[0],
+    );
+    let kern_second = compute_kernel(
+        c2[1],
+        cos_theta_sin_theta_lapl,
+        cos_theta_lapl_sq,
+        sin_theta_lapl_sq,
+        &isotropy_type[1],
+    );
+    let kern_third = compute_kernel(
+        c2[2],
+        cos_theta_sin_theta_grad,
+        cos_theta_grad_sq,
+        sin_theta_grad_sq,
+        &isotropy_type[2],
+    );
+    let kern_fourth = compute_kernel(
+        c2[3],
+        cos_theta_sin_theta_lapl,
+        cos_theta_lapl_sq,
+        sin_theta_lapl_sq,
+        &isotropy_type[3],
+    );
+
+    let mut derivatives: [T; 4] = [T::default(); 4];
+    let mut variance = T::default();
+    for k in 0..9 {
+        derivatives[0] += kern_first.0[k] * neighbour_pixel_lf[k];
+        derivatives[1] += kern_second.0[k] * neighbour_pixel_lf[k];
+        derivatives[2] += kern_third.0[k] * neighbour_pixel_hf[k];
+        derivatives[3] += kern_fourth.0[k] * neighbour_pixel_hf[k];
+        variance += neighbour_pixel_hf[k].powi(2);
+    }
+
+    variance = variance_threshold + variance * regularization_factor;
+
+    let mut acc = T::default();
+    for k in 0..4 {
+        acc += derivatives[k] * abcd[k];
+    }
+
+    acc = hf_input[(row, col)] * strength + acc / variance;
+
+    // The masked-fill reconstruction is `lf + acc` with NO clipping to
+    // non-negative values. The surrounding (unmasked) pixels are not
+    // clipped either (they take the `hf + lf` branch below), so values
+    // legitimately go negative; clamping the fill to zero was flooring
+    // the negative half of its distribution and manufacturing a
+    // homogeneous constant ring. With the clamp removed and `lf`
+    // spanning the mask (v1.1), the operator reproduces the nearby
+    // structure/multi-scale content. The general (mask=None) diffusion
+    // keeps the legacy clamp to preserve its existing behavior.
+    let v = lf_input[(row, col)] + acc;
+    if clip {
+        v.max(T::default())
+    } else {
+        v
+    }
+}
+
 fn heat_pde_diffusion<T: NdFloat + Default>(
     hf_input: ArrayView2<T>,
     lf_input: ArrayView2<T>,
@@ -260,147 +416,88 @@ fn heat_pde_diffusion<T: NdFloat + Default>(
     abcd: [T; 4],
     strength: T,
     mask: &Option<ArrayView2<bool>>,
+    scoped: Option<&[usize]>,
 ) {
     let mut output = output;
     let regularization_factor = regularization * current_radius_sq / T::from(9.0).unwrap();
-    let mut i_neighbours: [usize; 3] = [0, 0, 0];
-    let mut j_neighbours: [usize; 3] = [0, 0, 0];
-
-    let mut neighbour_pixel_hf = [T::default(); 9];
-    let mut neighbour_pixel_lf = [T::default(); 9];
-
-    let mut c2 = [T::default(); 4];
 
     let (height, width) = output.dim();
 
-    // for row in &process_points.0 {
-    for row in 0..height {
-        i_neighbours[0] = (cmp::max(row as i32 - (mult * H) as i32, 0) as i32) as usize;
-        i_neighbours[1] = row;
-        i_neighbours[2] = cmp::min((row + mult * H) as i32, height as i32 - 1) as usize;
-        // for col in &process_points.1 {
-        for col in 0..width {
-            j_neighbours[0] = cmp::max(col as i32 - (mult * H) as i32, 0) as usize;
-            j_neighbours[1] = col;
-            j_neighbours[2] = cmp::min((col + mult * H) as i32, width as i32 - 1) as usize;
+    // The masked-fill path (`clip == false`) leaves values unclipped; the legacy
+    // mask=None path (`clip == true`) clamps to non-negative.
+    let clip = mask.is_none();
 
-            let do_pixel = match mask {
-                Some(m) => m[(row, col)],
-                None => true,
-            };
-
-            if do_pixel {
-                for ii in 0..3 {
-                    for jj in 0..3 {
-                        neighbour_pixel_hf[3 * ii + jj] =
-                            hf_input[(i_neighbours[ii], j_neighbours[jj])];
-                        neighbour_pixel_lf[3 * ii + jj] =
-                            lf_input[(i_neighbours[ii], j_neighbours[jj])];
+    // The heavy masked branch uses a 3x3 neighborhood of `buffer_in` (the
+    // `lf_input` argument here) at offsets ±mult*H. Neighboring unmasked values
+    // are NOT constant across scales (they equal original - finer hf detail), so
+    // every cell a masked pixel can read must hold a correct value. Hence the
+    // loop must cover `masked ∪ read-halo` (halo = cells within Chebyshev
+    // distance mult of a masked cell). Far-field unmasked cells are never read by
+    // a masked pixel, so they need not be written here (they were pre-seeded by
+    // cloning the input in process_image).
+    match scoped {
+        Some(idxs) => {
+            for &idx in idxs {
+                let row = idx / width;
+                let col = idx % width;
+                let do_pixel = match mask {
+                    Some(m) => m[(row, col)],
+                    None => true,
+                };
+                if do_pixel {
+                    output[(row, col)] = diffusion_compute(
+                        hf_input,
+                        lf_input,
+                        row,
+                        col,
+                        mult,
+                        height,
+                        width,
+                        anisotropy,
+                        isotropy_type,
+                        variance_threshold,
+                        regularization_factor,
+                        abcd,
+                        strength,
+                        clip,
+                    );
+                } else {
+                    output[(row, col)] = hf_input[(row, col)] + lf_input[(row, col)];
+                }
+            }
+        }
+        None => {
+            // Legacy full-image path: mask=None (do every pixel), or mask=Some
+            // with no scoped list supplied. Kept verbatim-equivalent so the
+            // mask=None behavior is bit-for-bit unchanged and tests can exercise
+            // the full-scan masked path directly.
+            for row in 0..height {
+                for col in 0..width {
+                    let do_pixel = match mask {
+                        Some(m) => m[(row, col)],
+                        None => true,
+                    };
+                    if do_pixel {
+                        output[(row, col)] = diffusion_compute(
+                            hf_input,
+                            lf_input,
+                            row,
+                            col,
+                            mult,
+                            height,
+                            width,
+                            anisotropy,
+                            isotropy_type,
+                            variance_threshold,
+                            regularization_factor,
+                            abcd,
+                            strength,
+                            clip,
+                        );
+                    } else {
+                        output[(row, col)] = hf_input[(row, col)] + lf_input[(row, col)];
                     }
                 }
-
-                let mut gradient = find_gradients(Flat3Matrix(neighbour_pixel_lf));
-                let mut laplace = find_gradients(Flat3Matrix(neighbour_pixel_hf));
-
-                let magnitude_grad = (gradient[0].powi(2) + gradient[1].powi(2)).sqrt();
-                c2[0] = -magnitude_grad * anisotropy[0];
-                c2[2] = -magnitude_grad * anisotropy[2];
-
-                if magnitude_grad != T::default() {
-                    gradient[0] /= magnitude_grad;
-                    gradient[1] /= magnitude_grad;
-                } else {
-                    gradient[0] = T::from(1.0).unwrap();
-                    gradient[1] = T::default();
-                }
-                let cos_theta_grad_sq = gradient[0].powi(2);
-                let sin_theta_grad_sq = gradient[1].powi(2);
-                let cos_theta_sin_theta_grad = gradient[0] * gradient[1];
-
-                let magnitude_lapl = (laplace[0].powi(2) + laplace[1].powi(2)).sqrt();
-                c2[1] = -magnitude_lapl * anisotropy[1];
-                c2[3] = -magnitude_lapl * anisotropy[3];
-
-                if magnitude_lapl != T::default() {
-                    laplace[0] /= magnitude_lapl;
-                    laplace[1] /= magnitude_lapl;
-                } else {
-                    laplace[0] = T::from(1.0).unwrap();
-                    laplace[1] = T::default();
-                }
-
-                let cos_theta_lapl_sq = laplace[0].powi(2);
-                let sin_theta_lapl_sq = laplace[1].powi(2);
-                let cos_theta_sin_theta_lapl = laplace[0] * laplace[1];
-
-                for k in 0..4 {
-                    c2[k] = c2[k].exp();
-                }
-                let kern_first = compute_kernel(
-                    c2[0],
-                    cos_theta_sin_theta_grad,
-                    cos_theta_grad_sq,
-                    sin_theta_grad_sq,
-                    &isotropy_type[0],
-                );
-                let kern_second = compute_kernel(
-                    c2[1],
-                    cos_theta_sin_theta_lapl,
-                    cos_theta_lapl_sq,
-                    sin_theta_lapl_sq,
-                    &isotropy_type[1],
-                );
-                let kern_third = compute_kernel(
-                    c2[2],
-                    cos_theta_sin_theta_grad,
-                    cos_theta_grad_sq,
-                    sin_theta_grad_sq,
-                    &isotropy_type[2],
-                );
-                let kern_fourth = compute_kernel(
-                    c2[3],
-                    cos_theta_sin_theta_lapl,
-                    cos_theta_lapl_sq,
-                    sin_theta_lapl_sq,
-                    &isotropy_type[3],
-                );
-
-                let mut derivatives: [T; 4] = [T::default(); 4];
-                let mut variance = T::default();
-                for k in 0..9 {
-                    derivatives[0] += kern_first.0[k] * neighbour_pixel_lf[k];
-                    derivatives[1] += kern_second.0[k] * neighbour_pixel_lf[k];
-                    derivatives[2] += kern_third.0[k] * neighbour_pixel_hf[k];
-                    derivatives[3] += kern_fourth.0[k] * neighbour_pixel_hf[k];
-                    variance += neighbour_pixel_hf[k].powi(2);
-                }
-
-                variance = variance_threshold + variance * regularization_factor;
-
-                let mut acc = T::default();
-                for k in 0..4 {
-                    acc += derivatives[k] * abcd[k];
-                }
-
-                acc = hf_input[(row, col)] * strength + acc / variance;
-
-                // The masked-fill reconstruction is `lf + acc` with NO clipping to
-                // non-negative values. The surrounding (unmasked) pixels are not
-                // clipped either (they take the `hf + lf` branch below), so values
-                // legitimately go negative; clamping the fill to zero was flooring
-                // the negative half of its distribution and manufacturing a
-                // homogeneous constant ring. With the clamp removed and `lf`
-                // spanning the mask (v1.1), the operator reproduces the nearby
-                // structure/multi-scale content. The general (mask=None) diffusion
-                // keeps the legacy clamp to preserve its existing behavior.
-                let v = lf_input[(row, col)] + acc;
-                output[(row, col)] = if mask.is_some() {
-                    v
-                } else {
-                    v.max(T::default())
-                };
-            } else {
-                output[(row, col)] = hf_input[(row, col)] + lf_input[(row, col)];
             }
         }
     }
@@ -446,11 +543,14 @@ fn check_isotropy_mode<T: NdFloat + Default>(anisotropy: T) -> IsotropyType {
 fn _bspline_vertical_pass<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
     row: usize,
-    width: usize,
+    _width: usize,
     height: usize,
     mult: i32,
     clip_negatives: bool,
     out_buf: &mut [T],
+    filter: &[T; 5],
+    c_lo: usize,
+    c_hi: usize,
 ) {
     let irow = row as i32;
     let indicies: [usize; 5] = [
@@ -461,15 +561,7 @@ fn _bspline_vertical_pass<T: NdFloat + Default>(
         cmp::min((irow + 2 * mult) as usize, height - 1),
     ];
 
-    let filter: [T; 5] = [
-        T::from(1.0 / 16.0).unwrap(),
-        T::from(4.0 / 16.0).unwrap(),
-        T::from(6.0 / 16.0).unwrap(),
-        T::from(4.0 / 16.0).unwrap(),
-        T::from(1.0 / 16.0).unwrap(),
-    ];
-
-    for index in 0..width {
+    for index in c_lo..=c_hi {
         // The 5-tap filter weights sum to 1, so the weighted sum is the mean.
         let val_sum = filter.iter().enumerate().fold(T::default(), |acc, (k, &f)| {
             acc + in_array[(indicies[k], index)] * f
@@ -503,6 +595,7 @@ fn _bspline_horizontal<T: NdFloat + Default>(
     width: usize,
     mult: i32,
     clip_negatives: bool,
+    filter: &[T; 5],
 ) -> T {
     let icol = col as i32;
     let indicies: [usize; 5] = [
@@ -511,14 +604,6 @@ fn _bspline_horizontal<T: NdFloat + Default>(
         col,
         cmp::min((icol + mult) as usize, width - 1),
         cmp::min((icol + 2 * mult) as usize, width - 1),
-    ];
-
-    let filter: [T; 5] = [
-        T::from(1.0 / 16.0).unwrap(),
-        T::from(4.0 / 16.0).unwrap(),
-        T::from(6.0 / 16.0).unwrap(),
-        T::from(4.0 / 16.0).unwrap(),
-        T::from(1.0 / 16.0).unwrap(),
     ];
 
     // The 5-tap filter weights sum to 1, so the weighted sum is the mean.
@@ -550,6 +635,12 @@ fn _bspline_horizontal<T: NdFloat + Default>(
 /// * `height` - Image height
 /// * `mult` - Scale multiplier (1<<scale)
 /// * `row_buf` - Reusable buffer for vertical pass results
+/// * `region` - Optional inclusive `(r0, r1, c0, c1)` bounding region over which
+///   to run the decomposition. `None` runs the legacy full-image path (all rows
+///   and cols, bit-for-bit identical to before). `Some` computes lf/hf only
+///   within `[r0, r1]` rows and `[c0, c1]` cols (with the vertical pass extended
+///   to `c0-2m..c1+2m` so every horizontal tap's `row_buf` reads are valid);
+///   cells outside stay at whatever the buffers held.
 #[inline]
 fn decompose_2d_bspline<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
@@ -559,14 +650,42 @@ fn decompose_2d_bspline<T: NdFloat + Default>(
     height: usize,
     mult: i32,
     row_buf: &mut [T],
+    region: Option<(usize, usize, usize, usize)>,
 ) {
     let mut hf = hf;
     let mut lf = lf;
     let mut in_array = in_array;
-    for row in 0..height {
-        _bspline_vertical_pass(in_array.view_mut(), row, width, height, mult, true, row_buf);
-        for col in 0..width {
-            let blur = _bspline_horizontal(row_buf, col, width, mult, true);
+
+    let (r0, r1, c0, c1) = match region {
+        Some((r0, r1, c0, c1)) => (r0, r1, c0, c1),
+        None => (0, height - 1, 0, width - 1),
+    };
+
+    // Build the 5-tap filter ONCE per scale (numeric values identical to the
+    // old per-call construction), and reuse it for every vertical/horizontal tap.
+    let filter: [T; 5] = std::array::from_fn(|i| T::from(B_SPLINE_FILTER_F64[i]).unwrap());
+
+    let m = mult as usize;
+    // The vertical pass must fill row_buf over `[c0-2m, c1+2m]` so every
+    // horizontal tap at columns c0..=c1 (which reads row_buf[col±2m]) is valid.
+    let vc_lo = c0.saturating_sub(2 * m);
+    let vc_hi = (c1 + 2 * m).min(width - 1);
+
+    for row in r0..=r1 {
+        _bspline_vertical_pass(
+            in_array.view_mut(),
+            row,
+            width,
+            height,
+            mult,
+            true,
+            row_buf,
+            &filter,
+            vc_lo,
+            vc_hi,
+        );
+        for col in c0..=c1 {
+            let blur = _bspline_horizontal(row_buf, col, width, mult, true, &filter);
             let index = (row, col);
             lf[index] = blur;
             hf[index] = in_array[index] - blur;
@@ -646,6 +765,12 @@ fn num_steps_to_reach_equivalent_sigma<T: NdFloat + Default>(
 /// * `hf` - High-frequency components for each scale
 /// * `zoom` - Scaling factor for radius computation
 /// * `mask` - Optional boolean mask for selective processing
+/// * `scoped` - Precomputed per-scale masked∪halo regions used to scope the
+///   inverse diffusion pass when a mask is present (`None` keeps the legacy
+///   full-image diffusion).
+/// * `decomp_region` - Optional `(r0, r1, c0, c1)` bounding region over which
+///   the FORWARD B-spline decomposition runs (Stage 2). `None` keeps the legacy
+///   full-image decomposition (bit-for-bit identical).
 /// * `row_buf` - Pre-allocated buffer for B-spline passes
 fn wavelets_process<T: NdFloat + Default>(
     process_args: &ProcessArgs<T>,
@@ -657,6 +782,8 @@ fn wavelets_process<T: NdFloat + Default>(
     hf: &mut Vec<Array2<T>>,
     zoom: T,
     mask: &Option<ArrayView2<bool>>,
+    scoped: Option<&ScopedRegions>,
+    decomp_region: Option<(usize, usize, usize, usize)>,
     row_buf: &mut [T],
 ) {
     let anisotropy = [
@@ -708,6 +835,7 @@ fn wavelets_process<T: NdFloat + Default>(
             height,
             mult,
             row_buf,
+            decomp_region,
         );
 
         final_scale = sc;
@@ -769,6 +897,7 @@ fn wavelets_process<T: NdFloat + Default>(
             abcd,
             strength,
             mask,
+            scoped.map(|s| &s.halo[scale][..]),
         );
     }
 }
@@ -821,9 +950,9 @@ fn process_image<T: NdFloat + Default>(
     image_in: &mut ArrayViewMut2<T>,
     mask: Option<ArrayView2<bool>>,
 ) -> Array2<T> {
-    let mut image_out = Array2::<T>::zeros(image_in.dim());
-    let mut temp_1 = Array2::<T>::zeros(image_in.dim());
-    let mut temp_2 = Array2::<T>::zeros(image_in.dim());
+    let mut image_out: Array2<T>;
+    let mut temp_1: Array2<T>;
+    let mut temp_2: Array2<T>;
     let mut lf_odd = Array2::<T>::zeros(image_in.dim());
     let mut lf_even = Array2::<T>::zeros(image_in.dim());
 
@@ -833,6 +962,65 @@ fn process_image<T: NdFloat + Default>(
     let diffusion_scales =
         num_steps_to_reach_equivalent_sigma(T::from(B_SPLINE_SIGMA).unwrap(), final_radius);
     let scales = diffusion_scales.clamp(1, MAX_NUM_SCALES);
+
+    // Precompute the per-scale masked∪halo cell lists once. When a mask is
+    // present, the working buffers are pre-seeded with a CLONE of the input:
+    // unmasked pixels are immortal (= original) and, under scoping, far-field
+    // unmasked pixels are never re-written by diffusion, so seeding once keeps
+    // the final output (and next-iteration inputs) correct. When there is no
+    // mask, keep the exact legacy zeros init (bit-for-bit unchanged).
+    //
+    // Scoping only pays off when the masked∪halo footprint is a small part of
+    // the image. A mask that already covers much of the image (dense coverage,
+    // or one whose halos merge to fill the frame) reduces no work, so we fall
+    // back to the (fast) full-scan path and the legacy zeros init (bit-for-bit
+    // the original behavior). To avoid even paying for halo construction in
+    // that case, a cheap masked-fraction pre-check skips building scoped
+    // regions altogether for high-coverage masks; a second exact check on the
+    // largest halo also guards masks whose halos merge despite low coverage.
+    const MAX_HALO_FRACTION: f64 = 0.5;
+    const MAX_MASKED_FRACTION: f64 = 0.2;
+    let masked_fraction = mask.as_ref().map(|m| {
+        let cnt = m.iter().filter(|&&b| b).count();
+        let (h, w) = image_in.dim();
+        cnt as f64 / (h * w) as f64
+    });
+    let scoped = match masked_fraction {
+        // High-coverage mask: scoping cannot help; skip building entirely.
+        Some(f) if f > MAX_MASKED_FRACTION => None,
+        _ => match mask.as_ref().map(|m| build_scoped_regions(m, scales)) {
+            Some(s) => {
+                let (h, w) = image_in.dim();
+                let total = (h * w) as f64;
+                let largest = s.halo.iter().map(|h| h.len()).max().unwrap_or(0) as f64;
+                if total > 0.0 && largest / total > MAX_HALO_FRACTION {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            None => None,
+        },
+    };
+    // Stage 2: restrict the FORWARD B-spline decomposition to a single padded
+    // bounding region around the mask. Only meaningful when scoping is engaged
+    // (a mask is present and small enough); otherwise keep the legacy full
+    // decomposition (decomp_region = None), which is bit-for-bit identical.
+    let (h, w) = image_in.dim();
+    let decomp_region = mask
+        .as_ref()
+        .and_then(|m| if scoped.is_some() { compute_decomp_region(m, scales, h, w) } else { None });
+
+    if scoped.is_some() {
+        let base = image_in.to_owned();
+        image_out = base.clone();
+        temp_1 = base.clone();
+        temp_2 = base;
+    } else {
+        image_out = Array2::<T>::zeros(image_in.dim());
+        temp_1 = Array2::<T>::zeros(image_in.dim());
+        temp_2 = Array2::<T>::zeros(image_in.dim());
+    }
 
     let mut hf = (0..scales)
         .map(|_| Array2::<T>::zeros(image_in.dim()))
@@ -867,6 +1055,8 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                scoped.as_ref(),
+                decomp_region,
                 &mut row_buf,
             );
         } else if (it % 2) == 0 {
@@ -885,6 +1075,8 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                scoped.as_ref(),
+                decomp_region,
                 &mut row_buf,
             );
         } else {
@@ -903,6 +1095,8 @@ fn process_image<T: NdFloat + Default>(
                 &mut hf,
                 zoom,
                 &mask,
+                scoped.as_ref(),
+                decomp_region,
                 &mut row_buf,
             );
         }
@@ -1115,6 +1309,184 @@ struct Component {
     c0: usize,
     c1: usize,
     coords: Vec<(usize, usize)>,
+}
+
+/// Per-scale masked∪halo linear indices (row-major idx = r*width+c) for scoped
+/// diffusion.
+///
+/// When a mask is present, `heat_pde_diffusion` needs to touch only the masked
+/// cells (which run the heavy fill branch) plus the unmasked halo cells within a
+/// Chebyshev distance `mult` of some masked cell (which read the 3x3
+/// neighborhood of masked pixels and so must hold correct `hf + lf` values).
+/// Far-field unmasked cells are never read by any masked pixel and can be left
+/// as their pre-seeded clone value.
+struct ScopedRegions {
+    width: usize,
+    /// halo[scale] = masked cells ∪ Chebyshev(mult=1<<scale) neighborhood, as
+    /// linear indices (idx = r*width+c).
+    halo: Vec<Vec<usize>>,
+}
+
+/// Build the per-scale masked∪halo cell lists for scoped diffusion.
+///
+/// Computes a Chebyshev (max-norm) distance transform via a multi-source
+/// 8-connected BFS seeded at every masked pixel (distance 0 at masked cells,
+/// growing by 1 per 8-neighbor step outward). For each scale `s`, `halo[s]`
+/// holds every cell with `dist <= 1<<s`, which necessarily includes the masked
+/// cells and their `mult`-Chebyshev halo.
+///
+/// The BFS is bounded to `max_mult = 1 << (scales-1)`: no halo ever includes a
+/// cell whose Chebyshev distance exceeds `max_mult`, so cells beyond that radius
+/// are irrelevant and never expanded. This keeps the cost proportional to the
+/// `masked ∪ halo(max_mult)` footprint (tiny for sparse masks) rather than the
+/// full image, while producing the exact same halo sets as a whole-image scan.
+///
+/// Compute the single padded bounding region over which the FORWARD B-spline
+/// decomposition must run so that every cell `heat_pde_diffusion` reads
+/// (masked ∪ read-halo, Stage 1) reproduces the full-image lf/hf exactly.
+///
+/// Stage 2 scopes the forward decomposition to a single fixed region used for
+/// ALL scales. Its padding is CUMULATIVE: at the coarsest scale the separable
+/// 5-tap B-spline spans `2 * mult_s = 2 * 2^s` pixels on each side, and because
+/// each scale's `in` is itself a blurred version of the previous, the total
+/// half-width a cell's value can depend on is `max_mult + Σ_{s=1}^{scales-1}
+/// 2*mult_s` (with `max_mult = 1<<(scales-1)`). Padding the masked bounding box
+/// by that cumulative radius reproduces the full-image low/high frequencies at
+/// every cell heat_pde reads, so the inverse stage and output are correct.
+///
+/// Returns `None` (fall back to the full decomposition) when the resulting
+/// region would cover more than half the image (scoping would not reduce work),
+/// or when the mask is empty (nothing to inpaint).
+///
+/// # Arguments
+/// * `mask` - Boolean mask; True cells are the masked (read) region.
+/// * `scales` - Number of wavelet decomposition levels.
+/// * `h`, `w` - Image height and width.
+///
+/// # Returns
+/// * `Option<(usize, usize, usize, usize)>` - inclusive `(r0, r1, c0, c1)`.
+fn compute_decomp_region(
+    mask: &ArrayView2<bool>,
+    scales: usize,
+    h: usize,
+    w: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    // Cumulative padding: max_mult + Σ_{s=1}^{scales-1} 2*mult_s.
+    let max_mult = 1usize << scales.saturating_sub(1);
+    let mut pad = max_mult;
+    for s in 1..scales {
+        pad += 2usize << s;
+    }
+
+    // Bounding box of masked cells.
+    let mut mr0 = h;
+    let mut mr1 = 0usize;
+    let mut mc0 = w;
+    let mut mc1 = 0usize;
+    let mut any = false;
+    for i in 0..h {
+        for j in 0..w {
+            if mask[(i, j)] {
+                any = true;
+                mr0 = mr0.min(i);
+                mr1 = mr1.max(i);
+                mc0 = mc0.min(j);
+                mc1 = mc1.max(j);
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+
+    let r0 = mr0.saturating_sub(pad);
+    let r1 = (mr1 + pad).min(h - 1);
+    let c0 = mc0.saturating_sub(pad);
+    let c1 = (mc1 + pad).min(w - 1);
+
+    let area = (r1 - r0 + 1) * (c1 - c0 + 1);
+    if (area as f64) > 0.5 * (h * w) as f64 {
+        return None;
+    }
+    Some((r0, r1, c0, c1))
+}
+
+/// Build the per-scale masked∪halo cell lists for scoped diffusion.
+///
+/// Computes a Chebyshev (max-norm) distance transform via a multi-source
+/// 8-connected BFS seeded at every masked pixel (distance 0 at masked cells,
+/// growing by 1 per 8-neighbor step outward). For each scale `s`, `halo[s]`
+/// holds every cell with `dist <= 1<<s`, which necessarily includes the masked
+/// cells and their `mult`-Chebyshev halo.
+///
+/// The BFS is bounded to `max_mult = 1 << (scales-1)`: no halo ever includes a
+/// cell whose Chebyshev distance exceeds `max_mult`, so cells beyond that radius
+/// are irrelevant and never expanded. This keeps the cost proportional to the
+/// `masked ∪ halo(max_mult)` footprint (tiny for sparse masks) rather than the
+/// full image, while producing the exact same halo sets as a whole-image scan.
+///
+/// An empty mask yields empty halo rows (the caller short-circuits before
+/// reaching the diffusion, but the structure stays valid for tests).
+fn build_scoped_regions(mask: &ArrayView2<bool>, scales: usize) -> ScopedRegions {
+    let (height, width) = mask.dim();
+    let max_mult = 1usize << (scales.saturating_sub(1));
+
+    let mut dist = Array2::<u32>::from_elem((height, width), u32::MAX);
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    for r in 0..height {
+        for c in 0..width {
+            if mask[(r, c)] {
+                dist[(r, c)] = 0;
+                queue.push_back((r, c));
+            }
+        }
+    }
+
+    let mut halo = Vec::with_capacity(scales);
+    if queue.is_empty() {
+        // Empty mask: no masked cells -> every halo row is empty.
+        for _ in 0..scales {
+            halo.push(Vec::new());
+        }
+        return ScopedRegions { width, halo };
+    }
+
+    // Multi-source BFS over 8-neighbors tracking the Chebyshev distance to the
+    // nearest masked cell, bounded to distances <= max_mult. Each cell in range
+    // is recorded once with its distance.
+    let mut in_range: Vec<(usize, u32)> = Vec::new();
+    while let Some((ci, cj)) = queue.pop_front() {
+        let d = dist[(ci, cj)];
+        in_range.push((ci * width + cj, d));
+        if d >= max_mult as u32 {
+            continue; // beyond the largest needed radius: never in any halo
+        }
+        for (di, dj) in NEIGHBORS {
+            let ni = ci as i32 + di;
+            let nj = cj as i32 + dj;
+            if ni < 0 || nj < 0 || ni >= height as i32 || nj >= width as i32 {
+                continue;
+            }
+            let (ni, nj) = (ni as usize, nj as usize);
+            if dist[(ni, nj)] == u32::MAX {
+                dist[(ni, nj)] = d + 1;
+                queue.push_back((ni, nj));
+            }
+        }
+    }
+
+    for s in 0..scales {
+        let mult = 1usize << s;
+        halo.push(
+            in_range
+                .iter()
+                .filter(|&&(_, d)| (d as usize) <= mult)
+                .map(|&(idx, _)| idx)
+                .collect(),
+        );
+    }
+
+    ScopedRegions { width, halo }
 }
 
 /// 8-connected neighbour offsets (Chebyshev neighbourhood), shared by the
@@ -1924,6 +2296,13 @@ pub fn inpaint_mask<'py>(
         )));
     }
 
+    // Empty-mask short-circuit: nothing to inpaint. The unmasked passthrough is
+    // the exact identity (a no-op reconstruction), so returning an owned copy of
+    // the input is cheaper and matches the previous behavior.
+    if !mask_array.iter().any(|&b| b) {
+        return Ok(array.to_pyarray(py));
+    }
+
     let process_args = ProcessArgs {
         iterations,
         anisotropy_first,
@@ -2227,11 +2606,11 @@ mod tests {
         let mut out_buf = vec![0.0_f64; 7];
 
         // Row 1, col 3 (inside the block's columns): blurred above by the 1000s.
-        _bspline_vertical_pass(test_img.view_mut(), 1, 7, 7, 1, false, &mut out_buf);
+        _bspline_vertical_pass(test_img.view_mut(), 1, 7, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
         assert!(out_buf[3] > 1.0, "masked values should contribute to lf, got {}", out_buf[3]);
 
         // Deep in the block (row 3, col 3) lf reflects the high fill values.
-        _bspline_vertical_pass(test_img.view_mut(), 3, 7, 7, 1, false, &mut out_buf);
+        _bspline_vertical_pass(test_img.view_mut(), 3, 7, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
         assert!(out_buf[3] > 700.0, "deep-masked lf should reflect fill values, got {}", out_buf[3]);
     }
 
@@ -2244,10 +2623,10 @@ mod tests {
             row[c] = 1.0;
         }
 
-        let result1 = _bspline_horizontal(&row, 1, 7, 1, false);
+        let result1 = _bspline_horizontal(&row, 1, 7, 1, false, &B_SPLINE_FILTER_F64);
         assert_delta!(result1, 1.0, 1e-10);
 
-        let result2 = _bspline_horizontal(&row, 3, 7, 1, false);
+        let result2 = _bspline_horizontal(&row, 3, 7, 1, false, &B_SPLINE_FILTER_F64);
         assert_delta!(result2, 1.0, 1e-10);
     }
 
@@ -2260,7 +2639,7 @@ mod tests {
         img.fill(42.0);
         let mut out_buf = vec![0.0_f64; 3];
 
-        _bspline_vertical_pass(img.view_mut(), 1, 3, 3, 1, false, &mut out_buf);
+        _bspline_vertical_pass(img.view_mut(), 1, 3, 3, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 2);
         assert_delta!(out_buf[0], 42.0, 1e-10);
     }
 
@@ -2286,6 +2665,7 @@ mod tests {
             hf.view_mut(),
             lf.view_mut(),
             7, 7, 1, &mut row_buf,
+            None,
         );
 
         assert!(lf[(3, 3)] > 700.0, "lf at deep masked pixel should be non-zero, got {}", lf[(3, 3)]);
@@ -2311,6 +2691,7 @@ mod tests {
             hf.view_mut(),
             lf.view_mut(),
             10, 10, 1, &mut row_buf,
+            None,
         );
 
         assert_delta!(lf[(5, 5)], 2.0, 1e-9);
@@ -2609,4 +2990,474 @@ mod tests {
         }
     }
 
+    // --- Scoped diffusion tests (Option C, Stage 1) ---
+
+    #[test]
+    fn test_build_scoped_regions_membership() {
+        // A single masked pixel on a non-square (5x3) buffer: check that the
+        // mult=1 halo includes the masked cell and a Chebyshev distance-1
+        // neighbor, excludes a distance-2 cell, and the mult=2 halo re-includes
+        // it. Also verify the linear-index round trip decodes correctly.
+        let (h, w) = (5usize, 3usize);
+        let mut mask = Array2::<bool>::from_elem((h, w), false);
+        mask[(2, 1)] = true; // single masked cell
+        let regions = build_scoped_regions(&mask.view(), 2);
+
+        assert_eq!(regions.width, w);
+        assert_eq!(regions.halo.len(), 2);
+
+        // Round trip: decode(encode(r, c)) == (r, c).
+        for &idx in regions.halo[0].iter().chain(regions.halo[1].iter()) {
+            let r = idx / w;
+            let c = idx % w;
+            assert_eq!(r * w + c, idx, "linear-index round trip failed for {idx}");
+        }
+
+        // Masked cell (dist 0) always included.
+        assert!(regions.halo[0].contains(&(2 * w + 1)));
+        // Chebyshev distance-1 neighbor (e.g. (1,1)) included at mult=1.
+        assert!(regions.halo[0].contains(&(1 * w + 1)));
+        // Distance-2 cell (4,1) excluded at mult=1, re-included at mult=2.
+        assert!(!regions.halo[0].contains(&(4 * w + 1)));
+        assert!(regions.halo[1].contains(&(4 * w + 1)));
+    }
+
+    #[test]
+    fn test_build_scoped_regions_empty() {
+        // An all-False mask must produce empty halo rows and a valid width.
+        let mask = Array2::<bool>::from_elem((4, 6), false);
+        let regions = build_scoped_regions(&mask.view(), 3);
+        assert_eq!(regions.width, 6);
+        assert_eq!(regions.halo.len(), 3);
+        assert!(regions.halo.iter().all(|h| h.is_empty()));
+    }
+
+    #[test]
+    fn test_heat_pde_scoped_equals_fullscan() {
+        // The key golden test: running heat_pde_diffusion with the mask-Some
+        // full-scan path (scoped=None) and with the scoped path (scoped=Some)
+        // on IDENTICAL pre-seeded buffers must produce bit-for-bit identical
+        // output, because both share the same per-pixel worker. The mask
+        // combines a border-touching cell, an isolated pixel, and a central
+        // blob.
+        let (h, w) = (9usize, 7usize);
+        let mut mask = Array2::<bool>::from_elem((h, w), false);
+        mask[(0, 0)] = true; // border-touching corner
+        mask[(8, 6)] = true; // isolated pixel (opposite corner)
+        for r in 3..=5 {
+            for c in 3..=5 {
+                mask[(r, c)] = true; // central blob
+            }
+        }
+
+        // Deterministic pseudo-random hf/lf buffers.
+        let mut hf = Array2::<f64>::zeros((h, w));
+        let mut lf = Array2::<f64>::zeros((h, w));
+        let mut rng = StdRng::seed_from_u64(7);
+        let n = Normal::new(0.0, 1.0).unwrap();
+        for i in 0..h {
+            for j in 0..w {
+                hf[(i, j)] = n.sample(&mut rng);
+                lf[(i, j)] = n.sample(&mut rng);
+            }
+        }
+
+        let anisotropy = [0.5, 0.7, -0.3, 1.2];
+        let isotropy_type = [
+            IsotropyType::Isotrope,
+            IsotropyType::Isophote,
+            IsotropyType::Gradient,
+            IsotropyType::Isophote,
+        ];
+        let abcd = [0.0065, -0.25, -0.25, -0.2774];
+        let strength = 1.0;
+        let the_mask: Option<ArrayView2<bool>> = Some(mask.view());
+
+        // Full-scan masked path. Both buffers are pre-seeded with the identical
+        // passthrough `lf + hf` (mirroring real usage where the pre-seed equals
+        // the input and `lf + hf == input` at unmasked cells), so far-field
+        // unmasked cells hold the same value in both paths.
+        let mut preseed = Array2::<f64>::zeros((h, w));
+        for i in 0..h {
+            for j in 0..w {
+                preseed[(i, j)] = hf[(i, j)] + lf[(i, j)];
+            }
+        }
+        let mut out_full = preseed.clone();
+        heat_pde_diffusion(
+            hf.view(),
+            lf.view(),
+            out_full.view_mut(),
+            1,
+            anisotropy,
+            isotropy_type,
+            1.0,
+            0.0,
+            1.0,
+            abcd,
+            strength,
+            &the_mask,
+            None,
+        );
+
+        // Scoped path (mult = 1<<0 = 1).
+        let regions = build_scoped_regions(&mask.view(), 1);
+        let mut out_scoped = preseed.clone();
+        heat_pde_diffusion(
+            hf.view(),
+            lf.view(),
+            out_scoped.view_mut(),
+            1,
+            anisotropy,
+            isotropy_type,
+            1.0,
+            0.0,
+            1.0,
+            abcd,
+            strength,
+            &the_mask,
+            Some(&regions.halo[0][..]),
+        );
+
+        // Exact equality (identical expression ordering via the shared worker).
+        assert_eq!(out_full, out_scoped, "scoped and full-scan paths diverged");
+        // Sanity: the heavy branch actually ran (a masked blob pixel changed).
+        assert!((out_full[(4, 4)] - preseed[(4, 4)]).abs() > 1e-12);
+
+        // Far-field unmasked cells stay at their pre-seed value in the scoped
+        // path (they are never written), matching the full-scan passthrough.
+        assert_eq!(out_scoped[(0, 3)], preseed[(0, 3)]);
+        assert_eq!(out_full[(0, 3)], preseed[(0, 3)]);
+    }
+
+    #[test]
+    fn test_heat_pde_fully_masked_scoped_finite() {
+        // A fully-masked image must run without panicking, stay finite, and take
+        // the unclipped masked branch (values may legitimately go negative).
+        let (h, w) = (8usize, 8usize);
+        let mask = Array2::<bool>::from_elem((h, w), true);
+        // Smooth gradients guarantee a non-zero variance in every 3x3
+        // neighborhood, so the heavy branch stays finite (no div-by-zero).
+        let mut hf = Array2::<f64>::zeros((h, w));
+        let mut lf = Array2::<f64>::zeros((h, w));
+        for i in 0..h {
+            for j in 0..w {
+                hf[(i, j)] = 0.001 * i as f64 + 0.002 * j as f64 + 0.5;
+                lf[(i, j)] = 0.003 * i as f64 - 0.001 * j as f64 + 1.0;
+            }
+        }
+        let anisotropy = [0.0, 0.0, 0.0, 2.0];
+        let isotropy_type = [IsotropyType::Isotrope; 4];
+        let abcd = [0.0, 0.0, 0.0, 1.0];
+        let the_mask: Option<ArrayView2<bool>> = Some(mask.view());
+
+        let regions = build_scoped_regions(&mask.view(), 2);
+        let mut out = Array2::<f64>::zeros((h, w));
+        heat_pde_diffusion(
+            hf.view(),
+            lf.view(),
+            out.view_mut(),
+            2,
+            anisotropy,
+            isotropy_type,
+            1.0,
+            0.0,
+            1.0,
+            abcd,
+            1.0,
+            &the_mask,
+            Some(&regions.halo[1][..]),
+        );
+        assert!(out.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_process_image_empty_mask_returns_input() {
+        // With an empty mask the scoped regions are empty and process_image
+        // must return a copy of the input unchanged (the clone pre-seed).
+        let mut img = Array2::<f64>::zeros((6, 6));
+        for r in 0..6 {
+            for c in 0..6 {
+                img[(r, c)] = (r * 7 + c) as f64 * 0.1;
+            }
+        }
+        let mask = Array2::<bool>::from_elem((6, 6), false);
+        let pa = ProcessArgs {
+            iterations: 3,
+            anisotropy_first: 0.0,
+            anisotropy_second: 0.0,
+            anisotropy_third: 0.0,
+            anisotropy_fourth: 2.0,
+            regularization: 0.0,
+            variance_threshold: 0.0,
+            radius_center: 0.0,
+            first: 0.0,
+            second: 0.0,
+            third: 0.0,
+            fourth: 1.0,
+            radius: 3.0,
+            sharpness: 0.0,
+        };
+        let out = process_image(pa, &mut img.view_mut(), Some(mask.view()));
+        assert_eq!(out, img);
+    }
+
+    // --- Stage 2: scoped FORWARD B-spline decomposition tests ---
+
+    /// Run a full (region=None) and a region-restricted decompose on identical
+    /// inputs and assert hf/lf are f64-bit-exact inside the region.
+    fn assert_decomp_eq_full_in_region(img: &Array2<f64>, mask: &Array2<bool>, scales: usize, mult: i32) {
+        let (h, w) = img.dim();
+        let region = compute_decomp_region(&mask.view(), scales, h, w)
+            .expect("region should be Some for a small mask");
+        let (r0, r1, c0, c1) = region;
+
+        // Full path.
+        let mut hf_full = Array2::<f64>::zeros((h, w));
+        let mut lf_full = Array2::<f64>::zeros((h, w));
+        let mut img_full = img.clone();
+        let mut row_buf = vec![0.0_f64; w];
+        decompose_2d_bspline(
+            img_full.view_mut(),
+            hf_full.view_mut(),
+            lf_full.view_mut(),
+            w, h, mult, &mut row_buf, None,
+        );
+
+        // Restricted path (same region for every scale).
+        let mut hf_res = Array2::<f64>::zeros((h, w));
+        let mut lf_res = Array2::<f64>::zeros((h, w));
+        let mut img_res = img.clone();
+        let mut row_buf2 = vec![0.0_f64; w];
+        decompose_2d_bspline(
+            img_res.view_mut(),
+            hf_res.view_mut(),
+            lf_res.view_mut(),
+            w, h, mult, &mut row_buf2, Some(region),
+        );
+
+        for i in r0..=r1 {
+            for j in c0..=c1 {
+                assert_eq!(
+                    hf_full[(i, j)].to_bits(),
+                    hf_res[(i, j)].to_bits(),
+                    "hf bit-exactness failed at ({i},{j}) mult={mult}"
+                );
+                assert_eq!(
+                    lf_full[(i, j)].to_bits(),
+                    lf_res[(i, j)].to_bits(),
+                    "lf bit-exactness failed at ({i},{j}) mult={mult}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_restricted_decompose_equals_full_in_region() {
+        // Pseudo-random non-negative image with masked blocks. Covers three
+        // scenarios: a central multi-scale mask (cumulative region, scales=3),
+        // a border-touching mask, and a tiny mask. Use a large image so the
+        // cumulative pad (16 for scales=3) leaves a region under half the frame.
+        let (h, w) = (100usize, 100usize);
+        let mut rng = StdRng::seed_from_u64(99);
+        let n = Normal::new(5.0, 2.0).unwrap();
+        let mut img = Array2::<f64>::zeros((h, w));
+        for i in 0..h {
+            for j in 0..w {
+                let v: f64 = n.sample(&mut rng); img[(i, j)] = v.abs();
+            }
+        }
+
+        // Case A: central masked block, multi-scale region (scales=3).
+        let mut mask = Array2::<bool>::from_elem((h, w), false);
+        for i in 40..=49 {
+            for j in 42..=50 {
+                mask[(i, j)] = true;
+            }
+        }
+        for mult in [1i32, 2, 4] {
+            assert_decomp_eq_full_in_region(&img, &mask, 3, mult);
+        }
+
+        // Case B: border-touching mask (clamping of r0/c0/r1/c1).
+        let mut mask_b = Array2::<bool>::from_elem((h, w), false);
+        for i in 0..=4 {
+            for j in 0..=4 {
+                mask_b[(i, j)] = true;
+            }
+        }
+        for mult in [1i32, 4] {
+            assert_decomp_eq_full_in_region(&img, &mask_b, 3, mult);
+        }
+
+        // Case C: tiny region (a handful of masked pixels clustered so the wide
+        // cumulative padding dominates the region, yet stays under half-frame).
+        let mut mask_t = Array2::<bool>::from_elem((h, w), false);
+        mask_t[(48, 48)] = true;
+        mask_t[(48, 49)] = true;
+        mask_t[(49, 48)] = true;
+        for mult in [1i32, 4] {
+            assert_decomp_eq_full_in_region(&img, &mask_t, 3, mult);
+        }
+    }
+
+    #[test]
+    fn test_decompose_region_none_full_unchanged() {
+        // region=None must reproduce the legacy full decomposition: on a random
+        // image hf+lf reconstructs `in` exactly (bit-for-bit) everywhere, and on
+        // a constant image the full blur equals the constant.
+        let (h, w) = (12usize, 14usize);
+        let mut rng = StdRng::seed_from_u64(5);
+        let n = Normal::new(4.0, 2.0).unwrap();
+        let mut img = Array2::<f64>::zeros((h, w));
+        for i in 0..h {
+            for j in 0..w {
+                // Non-negative so the clamped low-pass never clips (and the
+                // exact hf+lf == in reconstruction holds bit-for-bit).
+                let v: f64 = n.sample(&mut rng); img[(i, j)] = v.abs();
+            }
+        }
+        let mut hf = Array2::<f64>::zeros((h, w));
+        let mut lf = Array2::<f64>::zeros((h, w));
+        let mut row_buf = vec![0.0_f64; w];
+        let mut img_c = img.clone();
+        decompose_2d_bspline(
+            img_c.view_mut(),
+            hf.view_mut(),
+            lf.view_mut(),
+            w, h, 3, &mut row_buf, None,
+        );
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    (lf[(i, j)] + hf[(i, j)]).to_bits(),
+                    img[(i, j)].to_bits(),
+                    "region=None reconstruction must be exact at ({i},{j})"
+                );
+            }
+        }
+
+        // Constant image: lf equals the constant blur everywhere (hoist-safe).
+        let cimg = Array2::<f64>::from_elem((10, 10), 2.0);
+        let mut hf2 = Array2::<f64>::zeros((10, 10));
+        let mut lf2 = Array2::<f64>::zeros((10, 10));
+        let mut row_buf2 = vec![0.0_f64; 10];
+        let mut cimg_c = cimg.clone();
+        decompose_2d_bspline(
+            cimg_c.view_mut(),
+            hf2.view_mut(),
+            lf2.view_mut(),
+            10, 10, 2, &mut row_buf2, None,
+        );
+        assert!(lf2.iter().all(|&v| (v - 2.0).abs() < 1e-12), "full blur equals constant");
+        assert!(hf2.iter().all(|&v| v == 0.0), "hf is zero on a constant image");
+    }
+
+    #[test]
+    fn test_wavelets_scoped_restricted_decomp() {
+        // End-to-end: running wavelets_process with a SCOPED inverse pass and a
+        // RESTRICTED forward decomposition must produce bit-identical output on
+        // the masked∪halo cells compared with the same scoped pass but a FULL
+        // (region=None) decomposition, while far-field unmasked cells keep their
+        // pre-seed (input) value exactly.
+        let (h, w) = (96usize, 96usize);
+        let mut rng = StdRng::seed_from_u64(31);
+        let n = Normal::new(2.0, 1.0).unwrap();
+        let mut img = Array2::<f64>::zeros((h, w));
+        for i in 0..h {
+            for j in 0..w {
+                let v: f64 = n.sample(&mut rng); img[(i, j)] = v.abs();
+            }
+        }
+
+        // Sparse mask: a central compact blob (so the cumulative region stays
+        // well under half the frame, leaving a sizeable far field).
+        let mut mask = Array2::<bool>::from_elem((h, w), false);
+        for i in 40..=46 {
+            for j in 38..=44 {
+                mask[(i, j)] = true;
+            }
+        }
+
+        let scales = 3usize;
+        let regions = build_scoped_regions(&mask.view(), scales);
+        let decomp_region = compute_decomp_region(&mask.view(), scales, h, w).expect("some region");
+        let the_mask: Option<ArrayView2<bool>> = Some(mask.view());
+
+        let pa = ProcessArgs {
+            iterations: 1,
+            anisotropy_first: 0.0,
+            anisotropy_second: 0.0,
+            anisotropy_third: 0.0,
+            anisotropy_fourth: 2.0,
+            regularization: 0.0,
+            variance_threshold: 0.0,
+            radius_center: 0.0,
+            first: 0.0,
+            second: 0.0,
+            third: 0.0,
+            fourth: 1.0,
+            radius: 5.0,
+            sharpness: 0.0,
+        };
+
+        // Run wavelets_process twice from identical pre-seeded buffers.
+        fn run(
+            pa: &ProcessArgs<f64>,
+            scales: usize,
+            img: &Array2<f64>,
+            the_mask: &Option<ArrayView2<bool>>,
+            regions: &ScopedRegions,
+            decomp_region: Option<(usize, usize, usize, usize)>,
+        ) -> Array2<f64> {
+            let (h, w) = img.dim();
+            let mut lf_odd = Array2::<f64>::zeros((h, w));
+            let mut lf_even = Array2::<f64>::zeros((h, w));
+            let mut hf = (0..scales).map(|_| Array2::<f64>::zeros((h, w))).collect::<Vec<_>>();
+            let mut reconstructed = img.clone(); // pre-seed === input (scoped semantics)
+            let mut row_buf = vec![0.0_f64; w];
+            wavelets_process(
+                pa, scales,
+                &mut img.clone().view_mut(),
+                &mut reconstructed.view_mut(),
+                &mut lf_odd, &mut lf_even, &mut hf,
+                f64::from(1.0),
+                the_mask,
+                Some(regions),
+                decomp_region,
+                &mut row_buf,
+            );
+            reconstructed
+        }
+        let out_full = run(&pa, scales, &img, &the_mask, &regions, None);
+        let out_restr = run(&pa, scales, &img, &the_mask, &regions, Some(decomp_region));
+
+        // masked∪halo cells: bit-identical (restriction reproduces full decomp there).
+        for &idx in regions.halo.iter().flat_map(|r| r.iter()) {
+            let i = idx / w;
+            let j = idx % w;
+            assert_eq!(
+                out_full[(i, j)].to_bits(),
+                out_restr[(i, j)].to_bits(),
+                "scoped masked∪halo diverged at ({i},{j})"
+            );
+        }
+
+        // Far-field unmasked (outside the halo): stays at the input pre-seed.
+        let in_halo = |i: usize, j: usize| {
+            regions.halo.iter().any(|r| r.contains(&(i * w + j)))
+        };
+        for i in 0..h {
+            for j in 0..w {
+                if !in_halo(i, j) {
+                    assert_eq!(out_restr[(i, j)].to_bits(), img[(i, j)].to_bits(),
+                        "far-field unmasked must equal input at ({i},{j})");
+                }
+            }
+        }
+        // Sanity: the heavy masked branch actually ran (a masked blob pixel moved).
+        assert!(mask[(43, 41)]);
+        let delta = (out_restr[(43, 41)] - img[(43, 41)]).abs();
+        assert!(delta > 1e-12, "masked pixel should have been diffused, delta={}", delta);
+    }
 }

@@ -334,6 +334,68 @@ class DiffusionTestCase(TestCase):
         # Result should be finite everywhere
         self.assertTrue(np.isfinite(result).all())
 
+    def test_inpaint_mask_scoped_finite_unmasked_unchanged(self):
+        """Regression: the scoped-diffusion optimization (Option C Stage 1) must
+        keep inpaint_mask producing finite output and leave unmasked cells
+        unchanged, matching the pre-optimization full-scan behavior on a
+        synthetic sparse/blobby mask.
+        """
+        np.random.seed(7)
+        # Smooth background with structure + noise.
+        y, x = np.mgrid[0:60, 0:60].astype(np.float64)
+        image = 30.0 + 0.03 * (x + y) + np.sin(x / 10.0) * np.cos(y / 10.0) * 2.0
+        image = image + np.random.normal(0.0, 0.2, (60, 60))
+
+        # A few small circular blobs (sparse mask).
+        mask = np.zeros((60, 60), dtype=bool)
+        yy, xx = np.mgrid[0:60, 0:60]
+        for (cy, cx, br) in [(12, 12, 4), (45, 30, 5), (10, 50, 3), (30, 45, 4), (50, 8, 3)]:
+            mask |= ((yy - cy) ** 2 + (xx - cx) ** 2) <= br ** 2
+        # Make some masked pixels deliberately extreme (saturated core).
+        image[mask] = 1000.0
+
+        result = rgb.inpaint_mask(image, mask, iterations=8, random_seed=42)
+
+        # Finite everywhere.
+        self.assertTrue(np.isfinite(result).all())
+        # Unmasked pixels (far from any mask) unchanged exactly.
+        far = ~mask
+        # Exclude a small halo around the masks where the unmasked passthrough
+        # still applies but float noise in lf/hf could be at the boundary; the
+        # exact hf+lf reconstruction should hold everywhere unmasked.
+        np.testing.assert_allclose(result[far], image[far], atol=1e-6)
+
+    def test_inpaint_mask_scoped_finite_decomp(self):
+        """Regression: the Stage-2 scoped FORWARD B-spline decomposition must
+        keep inpaint_mask producing finite output on a synthetic sparse/blobby
+        mask at iterations=8, and must leave far-field unmasked cells equal to
+        the input (the restricted decomposition never corrupts them).
+        """
+        np.random.seed(11)
+        y, x = np.mgrid[0:72, 0:72].astype(np.float64)
+        image = 25.0 + 0.02 * (x + y) + np.sin(x / 12.0) * np.cos(y / 14.0) * 1.5
+        image = image + np.random.normal(0.0, 0.15, (72, 72))
+
+        # Sparse/blobby mask: a few separated circular blobs.
+        mask = np.zeros((72, 72), dtype=bool)
+        yy, xx = np.mgrid[0:72, 0:72]
+        for (cy, cx, br) in [(16, 16, 5), (50, 30, 6), (14, 55, 4), (36, 50, 5), (55, 60, 4)]:
+            mask |= ((yy - cy) ** 2 + (xx - cx) ** 2) <= br ** 2
+        image[mask] = 1000.0  # extreme masked cores
+
+        result = rgb.inpaint_mask(image, mask, iterations=8, random_seed=42)
+
+        self.assertTrue(np.isfinite(result).all())
+
+        # Far-field unmasked cells (well outside any mask/halo) match the input.
+        far = ~mask
+        # Exclude a halo margin around the blobs where the unmasked passthrough
+        # still applies but the halo cells legitimately get scoped writes.
+        far = np.ones((72, 72), dtype=bool)
+        for (cy, cx, br) in [(16, 16, 5), (50, 30, 6), (14, 55, 4), (36, 50, 5), (55, 60, 4)]:
+            far &= ~(((yy - cy) ** 2 + (xx - cx) ** 2) <= (br + 24) ** 2)
+        np.testing.assert_allclose(result[far], image[far], atol=1e-6)
+
     def test_inpaint_boundary_fill_no_offset_negative(self):
         """boundary_fill (default) should handle Lab a/b-like values centered
         around zero with NO offsetting required, and produce a smooth boundary.
