@@ -28,10 +28,10 @@ are permitted provided that the following conditions are met:
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Multi-scale anisotropic diffusion over B-spline wavelets (heat PDE):
-//! high-level pipeline orchestration (buffer ping-pong, scale derivation, and
-//! the iteration loop). The actual per-pixel math lives in `kernel` and the
-//! wavelet step in `bspline`.
+//! High-level inpainting pipeline: split the image into scales, diffuse the
+//! high-frequency parts, and rebuild it, reusing two working buffers across
+//! scales so nothing is re-allocated. The per-pixel diffusion math lives in
+//! `kernel` and the wavelet decomposition step in `bspline`.
 
 use ndarray::{Array2, ArrayView2, ArrayViewMut2, NdFloat};
 use std::cmp;
@@ -42,30 +42,27 @@ use super::regions::{decide_scoping, ScopedPlan};
 const MAX_NUM_SCALES: usize = 10;
 const KAPPA: f64 = 0.25;
 
-/// Process image through multi-scale wavelet decomposition and diffusion
+/// Diffuse one round of the multi-scale decomposition.
 ///
-/// Orchestrates the complete diffusion pipeline:
-/// 1. Decomposes image into high/low frequency components at each scale
-/// 2. Applies anisotropic diffusion to high-frequency components
-/// 3. Reconstructs image by combining processed components
-///
-/// Uses ping-pong buffering between `lf_odd` and `lf_even` arrays to
-/// avoid excessive allocations during multi-scale decomposition.
+/// Decomposes the image into high/low frequency parts one scale at a time,
+/// then, in reverse order, diffuses each high-frequency part and rebuilds the
+/// image by combining it with the low-frequency residual. Work alternates
+/// between two low-frequency buffers (`lf_odd`/`lf_even`) across the forward
+/// scales and between two reconstruction buffers (`residual`/`temp`) across the
+/// reverse passes, so no new buffers are allocated per scale.
 ///
 /// # Arguments
-/// * `process_args` - All diffusion algorithm parameters
-/// * `scales` - Number of wavelet decomposition levels
-/// * `input` - Input image, modified during processing
-/// * `reconstructed` - Final output image
-/// * `lf_odd` - Low-frequency buffer for odd scales
-/// * `lf_even` - Low-frequency buffer for even scales
-/// * `hf` - High-frequency components for each scale
-/// * `zoom` - Scaling factor for radius computation
-/// * `mask` - Optional boolean mask for selective processing
-/// * `plan` - Optional scoping plan (per-scale masked∪halo regions plus an
-///   optional region-restricted forward decomposition). `None` keeps the legacy
-///   full-image diffusion and the full-image decomposition (bit-for-bit).
-/// * `row_buf` - Pre-allocated buffer for B-spline passes
+/// * `process_args` - Diffusion parameters (see [`ProcessArgs`]).
+/// * `scales` - Number of decomposition levels.
+/// * `input` - Image to diffuse; read at the start (first scale).
+/// * `reconstructed` - Final diffused image.
+/// * `lf_odd`, `lf_even` - The two low-frequency buffers, alternated per scale.
+/// * `hf` - High-frequency components, one array per scale.
+/// * `zoom` - Extra radius scale factor per scale.
+/// * `mask` - Optional boolean mask; when present only these pixels diffuse.
+/// * `plan` - Optional scoping plan (see `regions`); `None` keeps the legacy
+///   full-image behavior, identical bit-for-bit.
+/// * `row_buf` - Scratch buffer for the B-spline passes.
 fn wavelets_process<T: NdFloat + Default>(
     process_args: &ProcessArgs<T>,
     scales: usize,
@@ -196,49 +193,75 @@ fn wavelets_process<T: NdFloat + Default>(
     }
 }
 
-/// Parameters for diffusion algorithm configuration
+/// Tunable parameters for the diffusion algorithm.
 ///
-/// Encapsulates all tunable parameters for the anisotropic diffusion
-/// algorithm, including anisotropy weights, diffusion coefficients,
-/// and scale parameters.
+/// The raw internal knobs; each public Python function maps one of its
+/// arguments onto each field (see `mod.rs` for the defaults and meanings).
 pub(super) struct ProcessArgs<T: NdFloat + Default> {
+    /// Number of whole diffusion passes over the image.
     pub(super) iterations: usize,
+    /// Edge-preservation strength for the first directional derivative.
     pub(super) anisotropy_first: T,
+    /// Strength for the Laplacian-based second directional derivative.
     pub(super) anisotropy_second: T,
+    /// Strength for the third directional derivative.
     pub(super) anisotropy_third: T,
+    /// Strength for the fourth directional derivative.
     pub(super) anisotropy_fourth: T,
+    /// Regularization exponent: sets the minimum variance used for numerical
+    /// stability.
     pub(super) regularization: T,
+    /// Minimum variance added to the diffusion computation to avoid division
+    /// by zero.
     pub(super) variance_threshold: T,
+    /// Radius at which diffusion is strongest.
     pub(super) radius_center: T,
+    /// Diffusion radius; wider values use more decomposition scales and diffuse
+    /// more.
     pub(super) radius: T,
+    /// Diffusion coefficient 1 (weighted by position).
     pub(super) first: T,
+    /// Diffusion coefficient 2.
     pub(super) second: T,
+    /// Diffusion coefficient 3.
     pub(super) third: T,
+    /// Diffusion coefficient 4.
     pub(super) fourth: T,
+    /// Sharpness adjustment: positive keeps peaks, negative flattens them.
     pub(super) sharpness: T,
 }
 
-/// Apply complete anisotropic diffusion pipeline to image
+/// Run the full diffusion pipeline on an image.
 ///
-/// This is the top-level function that processes an image through
-/// multiple iterations of wavelet decomposition and diffusion:
+/// This is the top-level entry point. It works out how many decomposition
+/// scales are needed from the requested radius, then runs [`wavelets_process`]
+/// once per iteration (at least once), alternating between two working buffers
+/// between iterations and writing the final result into `image_out`.
 ///
-/// 1. Allocates working buffers (temp arrays, low-freq buffers, high-freq buffers)
-/// 2. Computes required wavelet decomposition scales based on radius
-/// 3. Iterates diffusion process, alternating between buffers
-/// 4. Returns final diffused image
+/// # Buffer initialization
+/// When scoping is used or the mask is empty (`decide_scoping` returns a plan),
+/// the working buffers are pre-filled with a copy of the input, so unmasked
+/// pixels keep their original values (an empty mask then returns the input
+/// unchanged). Otherwise — no mask, or a mask too dense to make scoping
+/// worthwhile — the buffers start at zero, matching the original behavior
+/// exactly.
+///
+/// # Scoping
+/// When a mask is present, `decide_scoping` picks whether restricting the work
+/// to the mask (plus a surrounding halo) is worthwhile. If it is not — a mask
+/// that already covers most of the image saves no work — the plain full-image
+/// path is used instead, leaving results unchanged.
 ///
 /// # Arguments
-/// * `process_args` - Complete diffusion configuration
-/// * `image_in` - Input image (modified during processing)
-/// * `mask` - Optional boolean mask for selective pixel processing
+/// * `process_args` - Diffusion parameters (see [`ProcessArgs`]).
+/// * `image_in` - Input image (read at the first iteration).
+/// * `mask` - Optional boolean mask of pixels to diffuse.
 ///
 /// # Returns
-/// * `Array2<T>` - Diffused image
+/// The diffused image.
 ///
 /// # Notes
-/// The number of iterations is clamped to minimum 1 to ensure
-/// at least one diffusion pass is always performed.
+/// `iterations` is clamped to at least 1 so one diffusion pass always runs.
 pub(super) fn process_image<T: NdFloat + Default>(
     process_args: ProcessArgs<T>,
     image_in: &mut ArrayViewMut2<T>,
@@ -257,20 +280,8 @@ pub(super) fn process_image<T: NdFloat + Default>(
         num_steps_to_reach_equivalent_sigma(T::from(B_SPLINE_SIGMA).unwrap(), final_radius);
     let scales = diffusion_scales.clamp(1, MAX_NUM_SCALES);
 
-    // Precompute the per-scale masked∪halo cell lists once. When a mask is
-    // present, the working buffers are pre-seeded with a CLONE of the input:
-    // unmasked pixels are immortal (= original) and, under scoping, far-field
-    // unmasked pixels are never re-written by diffusion, so seeding once keeps
-    // the final output (and next-iteration inputs) correct. When there is no
-    // mask, keep the exact legacy zeros init (bit-for-bit unchanged).
-    //
-    // Scoping only pays off when the masked∪halo footprint is a small part of
-    // the image. A mask that already covers much of the image (dense coverage,
-    // or one whose halos merge to fill the frame) reduces no work, so we fall
-    // back to the (fast) full-scan path and the legacy zeros init (bit-for-bit
-    // the original behavior). `decide_scoping` bundles the masked-fraction and
-    // largest-halo pre-checks together with the region-restricted forward
-    // decomposition selection.
+    // Decide the scoping plan once. Precompute the per-scale masked∪halo cell
+    // lists so the scoped path reuses them each iteration (see `regions`).
     let (h, w) = image_in.dim();
     let plan = decide_scoping(&mask, scales, h, w);
 
@@ -302,12 +313,12 @@ pub(super) fn process_image<T: NdFloat + Default>(
     let mut temp_out: &mut ArrayViewMut2<T>;
     let image_out_ref = &mut image_out.view_mut();
     for it in 0..iterations {
-        // Ping-pong between ping-pong buffers. The source and destination must
-        // be concrete and disjoint within each arm for the borrow checker: the
-        // src is read once per iteration (input, then alternating buffers) while
-        // the dest is written (image_out on the final pass, else the other
-        // temp). Each arm independently selects both so their borrows are
-        // provably non-overlapping (see the reference bindings above).
+        // Alternate between the two working buffers so the source and
+        // destination are always distinct arrays for the borrow checker: the
+        // source is read once per iteration (input, then alternating buffers)
+        // while the destination is written (`image_out` on the final pass,
+        // else the other working buffer). Each arm picks both explicitly so
+        // their borrows never overlap (see the reference bindings above).
         if it == 0 {
             if it == (iterations - 1) {
                 temp_out = image_out_ref;

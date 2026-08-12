@@ -35,9 +35,6 @@ are permitted provided that the following conditions are met:
 use ndarray::{ArrayView2, ArrayViewMut2, NdFloat};
 use std::cmp;
 
-/// Matrix representing rotations
-struct RotationMatrix<T: NdFloat + Default>([[T; 2]; 2]);
-
 /// Flattened 3x3 matrix
 struct Flat3Matrix<T: NdFloat + Default>([T; 9]);
 
@@ -91,169 +88,77 @@ fn isotrop_laplacian<T: NdFloat + Default>() -> Flat3Matrix<T> {
     ])
 }
 
-/// Compute rotation matrix for isophote-based anisotropic diffusion
+/// Compute the three independent second-difference "basis" values (V, W, C)
+/// of a 3x3 neighborhood `n` in row-major order.
 ///
-/// Generates a 2×2 rotation matrix that aligns diffusion perpendicular
-/// to image isophotes (lines of constant intensity). This preserves edges
-/// while smoothing along the isophote direction.
-///
-/// # Arguments
-/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
-/// * `cos_theta_sin_theta` - Product of normalized gradient components
-/// * `cos_theta2` - Square of normalized x-gradient
-/// * `sin_theta2` - Square of normalized y-gradient
-///
-/// # Returns
-/// * `[[T; 2]; 2]` - 2×2 rotation matrix
+/// Every rotation-derived (Isophote/Gradient) direction kernel reduces to a
+/// linear combination of these three values, so they are computed once per
+/// source field and shared by all four diffusion directions. The values are:
+/// * `V = n[3] + n[5] - 2*n[4]` - horizontal second difference
+/// * `W = n[1] + n[7] - 2*n[4]` - vertical second difference
+/// * `C = n[0] + n[8] - n[2] - n[6]` - diagonal second difference
 #[inline]
-fn rotation_matrix_isophote<T: NdFloat + Default>(
-    c2: T,
-    cos_theta_sin_theta: T,
-    cos_theta2: T,
-    sin_theta2: T,
-) -> RotationMatrix<T> {
-    let mut a: [[T; 2]; 2] = [[T::default(); 2]; 2];
-    a[0][0] = cos_theta2 + c2 * sin_theta2;
-    a[1][1] = c2 * cos_theta2 + sin_theta2;
-    a[0][1] = (c2 - T::from(1.0).unwrap()) * cos_theta_sin_theta;
-    a[1][0] = a[0][1];
-    RotationMatrix(a)
+fn compute_basis<T: NdFloat + Default>(n: &[T; 9]) -> [T; 3] {
+    let two = T::from(2.0).unwrap();
+    [
+        n[3] + n[5] - two * n[4],
+        n[1] + n[7] - two * n[4],
+        n[0] + n[8] - n[2] - n[6],
+    ]
 }
 
-/// Compute rotation matrix for gradient-based anisotropic diffusion
+/// Derivative from the fixed isotropic Laplacian kernel.
 ///
-/// Generates a 2×2 rotation matrix that aligns diffusion with the image
-/// gradient direction. This smooths in the direction of greatest change
-/// while preserving perpendicular features.
-///
-/// # Arguments
-/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
-/// * `cos_theta_sin_theta` - Product of normalized gradient components
-/// * `cos_theta2` - Square of normalized x-gradient
-/// * `sin_theta2` - Square of normalized y-gradient
-///
-/// # Returns
-/// * `[[T; 2]; 2]` - 2×2 rotation matrix
+/// Edge-preserving and independent of `c2` and the local orientation, so it
+/// needs no per-direction kernel construction.
 #[inline]
-fn rotation_matrix_gradient<T: NdFloat + Default>(
-    c2: T,
-    cos_theta_sin_theta: T,
-    cos_theta2: T,
-    sin_theta2: T,
-) -> RotationMatrix<T> {
-    let mut a: [[T; 2]; 2] = [[T::default(); 2]; 2];
-    a[0][0] = c2 * cos_theta2 + sin_theta2;
-    a[1][1] = cos_theta2 + c2 * sin_theta2;
-    a[0][1] = (T::from(1.0).unwrap() - c2) * cos_theta_sin_theta;
-    a[1][0] = a[0][1];
-    RotationMatrix(a)
+fn isotrope_derivative<T: NdFloat + Default>(n: &[T; 9]) -> T {
+    let lap = isotrop_laplacian::<T>();
+    let mut acc = T::default();
+    for k in 0..9 {
+        acc += lap.0[k] * n[k];
+    }
+    acc
 }
 
-/// Build 3×3 diffusion kernel from 2×2 rotation matrix
+/// Evaluate one diffusion direction against a source field's precomputed
+/// basis.
 ///
-/// Converts a rotation matrix derived from image gradients into a
-/// 3×3 convolution kernel for anisotropic diffusion. The kernel
-/// incorporates the rotation information to create directionally-
-/// dependent diffusion behavior.
-///
-/// # Arguments
-/// * `a` - 2×2 rotation matrix encoding gradient information
-///
-/// # Returns
-/// * `Flat3Matrix<T>` - 3×3 kernel coefficients in row-major order
-#[inline]
-fn build_matrix<T: NdFloat + Default>(a: RotationMatrix<T>) -> Flat3Matrix<T> {
-    let a = a.0;
-    let b11 = a[0][1] / T::from(2.0).unwrap();
-    let b13 = -b11;
-    let b22 = T::from(-2.0).unwrap() * (a[0][0] + a[1][1]);
-
-    Flat3Matrix([b11, a[1][1], b13, a[0][0], b22, a[0][0], b13, a[1][1], b11])
-}
-
-/// Compute 3×3 diffusion kernel based on isotropy type
-///
-/// Selects and constructs the appropriate kernel for anisotropic diffusion
-/// based on the specified isotropy type. The kernel encodes directional
-/// diffusion behavior derived from image structure tensors.
-///
-/// # Arguments
-/// * `c2` - Anisotropy factor squared (exp(-|∇u| * anisotropy))
-/// * `cos_theta_sin_theta` - Cross product of normalized gradient
-/// * `cos_theta2` - Square of normalized x-gradient
-/// * `sin_theta2` - Square of normalized y-gradient
-/// * `isotropy_type` - Type of anisotropic behavior to apply
-///
-/// # Returns
-/// * `Flat3Matrix<T>` - 3×3 kernel coefficients in row-major order
-#[inline]
-fn compute_kernel<T: NdFloat + Default>(
+/// For Isophote/Gradient the 3x3 kernel is entirely determined by the rotation
+/// triple `(a00, a11, a01)` (see `build_matrix`), so the derivative collapses
+/// to the 3-term dot product `a00*V + a11*W + (a01/2)*C` over the shared
+/// basis. For Isotrope it is the fixed Laplacian (no `c2`/orientation use).
+#[inline(always)]
+fn direction_derivative<T: NdFloat + Default>(
     c2: T,
     cos_theta_sin_theta: T,
     cos_theta2: T,
     sin_theta2: T,
     isotropy_type: &IsotropyType,
-) -> Flat3Matrix<T> {
+    basis: [T; 3],
+    n: &[T; 9],
+) -> T {
     match isotropy_type {
-        IsotropyType::Isotrope => isotrop_laplacian(),
+        IsotropyType::Isotrope => isotrope_derivative(n),
         IsotropyType::Isophote => {
-            let iso_matrix =
-                rotation_matrix_isophote(c2, cos_theta_sin_theta, cos_theta2, sin_theta2);
-            build_matrix(iso_matrix)
+            let a00 = cos_theta2 + c2 * sin_theta2;
+            let a11 = c2 * cos_theta2 + sin_theta2;
+            let a01 = (c2 - T::from(1.0).unwrap()) * cos_theta_sin_theta;
+            basis[0] * a00 + basis[1] * a11 + basis[2] * (T::from(0.5).unwrap() * a01)
         }
         IsotropyType::Gradient => {
-            let rot_matrix =
-                rotation_matrix_gradient(c2, cos_theta_sin_theta, cos_theta2, sin_theta2);
-            build_matrix(rot_matrix)
+            let a00 = c2 * cos_theta2 + sin_theta2;
+            let a11 = cos_theta2 + c2 * sin_theta2;
+            let a01 = (T::from(1.0).unwrap() - c2) * cos_theta_sin_theta;
+            basis[0] * a00 + basis[1] * a11 + basis[2] * (T::from(0.5).unwrap() * a01)
         }
     }
 }
 
-/// Apply anisotropic diffusion PDE to image subregions using four-derivative approach
-///
-/// Implements the heat equation with variable diffusion coefficients:
-///
-///     ∂u/∂t = ∇·(c(x,y,∇u)∇u)
-///
-/// where c(x,y,∇u) = exp(-|∇u| * anisotropy) controls edge preservation.
-/// High gradient regions (edges) have low diffusion coefficients, while
-/// flat regions diffuse more strongly.
-///
-/// The four-derivative approach captures directional information:
-/// [0,2] - Gradient-based diffusion (horizontal/vertical components)
-/// [1,3] - Laplacian-based diffusion (diagonal components)
-///
-/// # Arguments
-/// * `hf_input` - High-frequency component (wavelet detail coefficients)
-/// * `lf_input` - Low-frequency component (wavelet approximation)
-/// * `output` - Output array, modified in-place
-/// * `mult` - Scale multiplier (1<<scale), determines neighborhood size
-/// * `anisotropy` - Anisotropy parameters for four diffusion terms
-/// * `isotropy_type` - Isotropy mode for each of four terms
-/// * `variance_threshold` - Minimum variance for numerical stability
-/// * `regularization` - Regularization parameter
-/// * `current_radius_sq` - Current scale radius squared
-/// * `abcd` - Four diffusion coefficients weighted by position
-/// * `strength` - Overall diffusion strength multiplier
-/// * `mask` - Optional boolean mask for selective pixel processing
-/// * `scoped` - Optional linear indices (row-major, idx=r*width+c) of the cells
-///   to process for the current scale (`masked ∪ read-halo`). `Some` scopes the
-///   loop to just those cells instead of the full image; `None` falls back to
-///   the full-image loop (exactly preserving the legacy mask=None and
-///   full-scan-masked behavior). The heavy masked branch and the unmasked
-///   `hf + lf` passthrough are shared by both paths, so the two produce
-///   identical numerics for the cells they have in common.
-///
-/// # Notes
-/// The diffusion coefficient computation: c = exp(-|∇u| * anisotropy)
-/// ensures edge preservation: high gradient = low diffusion.
-///
-/// Yields the `(row, col)` cells that [`heat_pde_diffusion`] must touch.
-///
-/// `Scoped` decodes a slice of linear indices (`idx = r*width + c`); `Full`
-/// iterates the whole `h x w` Cartesian grid in row-major order. Both produce
-/// the exact same cell order as the pre-refactor dual loop, so numerics are
-/// bit-identical.
+/// Which cells [`heat_pde_diffusion`] iterates over: a scoped slice of linear
+/// indices (`idx = r*width + c`) or the whole `h x w` grid in row-major order.
+/// Both yield the exact same cell order as the pre-refactor dual loop, so
+/// numerics are bit-identical.
 enum CellIter<'a> {
     Scoped {
         idxs: &'a [usize],
@@ -295,6 +200,32 @@ impl<'a> Iterator for CellIter<'a> {
     }
 }
 
+/// Apply anisotropic diffusion to the chosen cells via [`diffusion_compute`].
+///
+/// This is the bit-exact heavy worker shared by the full-scan and scoped paths.
+/// See the module landing doc in `mod.rs` for the heat-PDE model and the
+/// four-derivative breakdown driving the four directions.
+///
+/// # Arguments
+/// * `hf_input` - High-frequency component (wavelet detail coefficients)
+/// * `lf_input` - Low-frequency component (wavelet approximation)
+/// * `output` - Output array, modified in-place
+/// * `mult` - Scale multiplier (1<<scale), determines neighborhood size
+/// * `anisotropy` - Anisotropy parameters for four diffusion terms
+/// * `isotropy_type` - Isotropy mode for each of four terms
+/// * `variance_threshold` - Minimum variance for numerical stability
+/// * `regularization` - Regularization parameter
+/// * `current_radius_sq` - Current scale radius squared
+/// * `abcd` - Four diffusion coefficients weighted by position
+/// * `strength` - Overall diffusion strength multiplier
+/// * `mask` - Optional boolean mask for selective pixel processing
+/// * `scoped` - Optional linear indices (row-major, idx=r*width+c) of the cells
+///   to process for the current scale (`masked ∪ read-halo`). `Some` scopes the
+///   loop to just those cells instead of the full image; `None` falls back to
+///   the full-image loop (exactly preserving the legacy mask=None and
+///   full-scan-masked behavior). The heavy masked branch and the unmasked
+///   `hf + lf` passthrough are shared by both paths, so the two produce
+///   identical numerics for the cells they have in common.
 pub(super) fn heat_pde_diffusion<T: NdFloat + Default>(
     hf_input: ArrayView2<T>,
     lf_input: ArrayView2<T>,
@@ -422,13 +353,14 @@ fn diffusion_compute<T: NdFloat + Default>(
     c2[0] = -magnitude_grad * anisotropy[0];
     c2[2] = -magnitude_grad * anisotropy[2];
 
-    if magnitude_grad != T::default() {
-        gradient[0] /= magnitude_grad;
-        gradient[1] /= magnitude_grad;
-    } else {
-        gradient[0] = T::from(1.0).unwrap();
-        gradient[1] = T::default();
-    }
+    // Normalize the gradient to a unit direction, branchlessly selecting the
+    // (1, 0) fallback for a zero gradient: `s` is 1.0 when the magnitude is
+    // non-zero, and `safe` is the magnitude (or 1.0 when it is zero, avoiding
+    // a 0/0 NaN). The result is bit-identical to the former `if`/`else`.
+    let s = T::from((magnitude_grad != T::default()) as u8).unwrap();
+    let safe = s * magnitude_grad + (T::from(1.0).unwrap() - s);
+    gradient[0] = s * (gradient[0] / safe) + (T::from(1.0).unwrap() - s);
+    gradient[1] = s * (gradient[1] / safe);
     let cos_theta_grad_sq = gradient[0].powi(2);
     let sin_theta_grad_sq = gradient[1].powi(2);
     let cos_theta_sin_theta_grad = gradient[0] * gradient[1];
@@ -437,57 +369,71 @@ fn diffusion_compute<T: NdFloat + Default>(
     c2[1] = -magnitude_lapl * anisotropy[1];
     c2[3] = -magnitude_lapl * anisotropy[3];
 
-    if magnitude_lapl != T::default() {
-        laplace[0] /= magnitude_lapl;
-        laplace[1] /= magnitude_lapl;
-    } else {
-        laplace[0] = T::from(1.0).unwrap();
-        laplace[1] = T::default();
-    }
+    let s = T::from((magnitude_lapl != T::default()) as u8).unwrap();
+    let safe = s * magnitude_lapl + (T::from(1.0).unwrap() - s);
+    laplace[0] = s * (laplace[0] / safe) + (T::from(1.0).unwrap() - s);
+    laplace[1] = s * (laplace[1] / safe);
 
     let cos_theta_lapl_sq = laplace[0].powi(2);
     let sin_theta_lapl_sq = laplace[1].powi(2);
     let cos_theta_sin_theta_lapl = laplace[0] * laplace[1];
 
     for k in 0..4 {
-        c2[k] = c2[k].exp();
+        // `c2` is only used by Isophote/Gradient directions; an Isotrope
+        // direction uses the fixed Laplacian kernel and discards it, so skip
+        // the (expensive) exponentiation there. `isotropy_type` is fixed for
+        // the whole call, so this branch is decided once, not per cell.
+        if isotropy_type[k] != IsotropyType::Isotrope {
+            c2[k] = c2[k].exp();
+        }
     }
-    let kern_first = compute_kernel(
+
+    // All rotation-derived (Isophote/Gradient) direction kernels reduce to a
+    // 3-term dot product over these per-source basis values, computed once
+    // here and shared by the four directions.
+    let basis_lf = compute_basis(&neighbour_pixel_lf);
+    let basis_hf = compute_basis(&neighbour_pixel_hf);
+
+    let mut derivatives: [T; 4] = [T::default(); 4];
+    derivatives[0] = direction_derivative(
         c2[0],
         cos_theta_sin_theta_grad,
         cos_theta_grad_sq,
         sin_theta_grad_sq,
         &isotropy_type[0],
+        basis_lf,
+        &neighbour_pixel_lf,
     );
-    let kern_second = compute_kernel(
+    derivatives[1] = direction_derivative(
         c2[1],
         cos_theta_sin_theta_lapl,
         cos_theta_lapl_sq,
         sin_theta_lapl_sq,
         &isotropy_type[1],
+        basis_lf,
+        &neighbour_pixel_lf,
     );
-    let kern_third = compute_kernel(
+    derivatives[2] = direction_derivative(
         c2[2],
         cos_theta_sin_theta_grad,
         cos_theta_grad_sq,
         sin_theta_grad_sq,
         &isotropy_type[2],
+        basis_hf,
+        &neighbour_pixel_hf,
     );
-    let kern_fourth = compute_kernel(
+    derivatives[3] = direction_derivative(
         c2[3],
         cos_theta_sin_theta_lapl,
         cos_theta_lapl_sq,
         sin_theta_lapl_sq,
         &isotropy_type[3],
+        basis_hf,
+        &neighbour_pixel_hf,
     );
 
-    let mut derivatives: [T; 4] = [T::default(); 4];
     let mut variance = T::default();
     for k in 0..9 {
-        derivatives[0] += kern_first.0[k] * neighbour_pixel_lf[k];
-        derivatives[1] += kern_second.0[k] * neighbour_pixel_lf[k];
-        derivatives[2] += kern_third.0[k] * neighbour_pixel_hf[k];
-        derivatives[3] += kern_fourth.0[k] * neighbour_pixel_hf[k];
         variance += neighbour_pixel_hf[k].powi(2);
     }
 
@@ -544,41 +490,29 @@ mod tests {
     use rand_distr::{Distribution, Normal};
 
     #[test]
-    fn test_find_gradients_flat() {
-        let pixels = Flat3Matrix([0.0; 9]);
-        let grad = find_gradients(pixels);
+    fn test_find_gradients() {
+        // Flat image: zero gradient.
+        let grad = find_gradients(Flat3Matrix([0.0; 9]));
         assert_delta!(grad[0], 0.0, 1e-10);
         assert_delta!(grad[1], 0.0, 1e-10);
-    }
-
-    #[test]
-    fn test_find_gradients_slope_x() {
-        let pixels = Flat3Matrix([0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
-        let grad = find_gradients(pixels);
-        // Gradient in x direction (columns 3,4,5)
+        // Horizontal slope (columns 3,4,5): vertical gradient is zero.
+        let grad = find_gradients(Flat3Matrix([
+            0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0,
+        ]));
         assert_delta!(grad[1], 0.0, 1e-10);
-    }
-
-    #[test]
-    fn test_find_gradients_slope_y() {
-        let pixels = Flat3Matrix([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let grad = find_gradients(pixels);
-        // Gradient in y direction (rows 0,1,2)
-        // pixels[7] - pixels[1] = 1.0 - 0.0 = 1.0
-        // grad[0] = 1.0 / 2.0 = 0.5
+        // Vertical slope (rows 0,1,2): pixels[7]-pixels[1] = 1.0, so grad[0] = 0.5.
+        let grad = find_gradients(Flat3Matrix([
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ]));
         assert_delta!(grad[0], 0.5, 1e-10);
     }
 
     #[test]
-    fn test_isotrop_laplacian_sum() {
+    fn test_isotrop_laplacian() {
         let lap = isotrop_laplacian::<f64>();
+        // A Laplacian kernel should sum to zero, with a negative center.
         let sum: f64 = lap.0.iter().map(|&x| x as f64).sum();
         assert_delta!(sum, 0.0, 1e-10);
-    }
-
-    #[test]
-    fn test_isotrop_laplacian_center() {
-        let lap = isotrop_laplacian::<f64>();
         assert_delta!(lap.0[4], -3.0, 1e-10);
     }
 
@@ -594,6 +528,52 @@ mod tests {
         assert_eq!(check_isotropy_mode(0.0), IsotropyType::Isotrope);
         assert_eq!(check_isotropy_mode(1.0), IsotropyType::Isophote);
         assert_eq!(check_isotropy_mode(-1.0), IsotropyType::Gradient);
+    }
+
+    #[test]
+    fn test_direction_derivative_matches_nine_tap() {
+        // The factored form `a00*V + a11*W + (a01/2)*C` must agree (to f64
+        // rounding) with the original explicit 9-tap kernel application.
+        use rand::{Rng, SeedableRng};
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(2024);
+        for _ in 0..500 {
+            let mut n = [0.0_f64; 9];
+            for e in n.iter_mut() {
+                *e = rng.gen_range(-2.0..2.0);
+            }
+            let c2 = rng.gen_range(0.05..3.0);
+            let cos_sin = rng.gen_range(-1.0..1.0);
+            let cos2 = rng.gen_range(0.0..1.0);
+            let sin2 = rng.gen_range(0.0..1.0);
+            // Recompute direction_derivative and the direct 9-tap dot and
+            // compare for both Isophote and Gradient.
+            for iso in [IsotropyType::Isophote, IsotropyType::Gradient] {
+                let basis = compute_basis(&n);
+                let factored = direction_derivative(c2, cos_sin, cos2, sin2, &iso, basis, &n);
+                let (a00, a11, a01) = match iso {
+                    IsotropyType::Isophote => (
+                        cos2 + c2 * sin2,
+                        c2 * cos2 + sin2,
+                        (c2 - 1.0) * cos_sin,
+                    ),
+                    IsotropyType::Gradient => (
+                        c2 * cos2 + sin2,
+                        cos2 + c2 * sin2,
+                        (1.0 - c2) * cos_sin,
+                    ),
+                    _ => unreachable!(),
+                };
+                let half = a01 / 2.0;
+                let kernel = [
+                    half, a11, -half, a00, -2.0 * (a00 + a11), a00, -half, a11, half,
+                ];
+                let direct: f64 = kernel.iter().zip(n.iter()).map(|(k, &v)| k * v).sum();
+                let delta = (factored - direct).abs();
+                let scale = 1.0 + direct.abs();
+                assert!(delta < 1e-9 * scale, "iso={iso:?} factored={factored} direct={direct}");
+            }
+        }
     }
 
     // --- Scoped diffusion tests (Option C, Stage 1) ---

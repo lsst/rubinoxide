@@ -48,24 +48,19 @@ const LOOKUP_DENOM_EPS: f64 = 1e-12;
 /// How far the colour curve is kept beyond the queried L range (to tighten the lookup).
 const COLOUR_CURVE_L_PAD: f64 = 0.05;
 
-/// Estimate the star's intrinsic colour for `comp` by integrating conserved
-/// per-band flux in linear RGB.
+/// Estimate a star's intrinsic colour by integrating its per-band linear-RGB
+/// flux over a disk around the component centroid.
 ///
-/// Explanation: for a telescope whose chromatic diffraction spikes are rotated /
-/// smeared into a starburst pattern (e.g. multi-exposure, rotating mount), the
-/// per-pixel `a`/`b` (and thus hue) is noise-chromatic and useless. But the
-/// misalignment only *redistributes* each band's light — it conserves total
-/// flux. So integrating the background-subtracted linear-RGB flux over a region
-/// that encloses the whole starburst recovers the star's intrinsic colour ratio.
+/// The disk has radius `radius` around the centroid. The background sky is the
+/// per-channel median of the ring between `bg_inner` and `bg_outer` about the
+/// same centre, and this median is subtracted from every pixel before summing;
+/// only unmasked pixels contribute. Returns `None` if the total subtracted flux
+/// is below `MIN_FLUX`, meaning the region is too faint to trust (dominated by
+/// noise) and the component should be left untouched.
 ///
-/// The region is a disk of `radius` around the component centroid; the
-/// background is the median linear-RGB in the ring `[bg_inner, bg_outer]` around
-/// the same centre. Only unmasked pixels are used. Returns `None` if the
-/// integrated flux is too small to trust (faint star / dominated by noise).
-///
-/// This consumes a precomputed linear-RGB buffer (`linear_rgb`, shape (h, w, 3)) owned
-/// by the caller (materialised once per `reconstruct_star_color` call rather than
-/// once per component), instead of deriving linear RGB from Oklab here.
+/// `linear_rgb` is a precomputed (h, w, 3) linear-RGB buffer, materialised once
+/// per `reconstruct_star_color` call (not once per component) by the caller and
+/// shared here across all stars.
 fn estimate_star_linear_colour(
     linear_rgb: &Array3<f64>,
     mask: &ArrayView2<bool>,

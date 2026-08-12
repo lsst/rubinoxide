@@ -183,25 +183,6 @@ class DiffusionTestCase(TestCase):
         self.assertLess(masked.max(), 0.5 + 0.03)
         self.assertGreater(masked.min(), 0.5 - 0.03)
 
-    def test_inpaint_noise_init_inverse(self):
-        """init_method='noise' seeds the masked pixels stochastically, so a
-        single masked pixel produces seed-to-seed variation (the stochastic
-        structure is preserved, not flattened out by a smoothing band)."""
-        test_image = np.ones((50, 50), dtype=np.float64) * 0.5
-        mask = np.zeros((50, 50), dtype=bool)
-        mask[25, 25] = True
-
-        results = []
-        for seed in range(10):
-            result = rgb.inpaint_mask(
-                test_image, mask, iterations=5, random_seed=seed, init_method="noise"
-            )
-            results.append(result[25, 25])
-
-        # The noise init contributes real per-seed structure.
-        self.assertGreater(np.std(results), 0.01)
-        self.assertTrue(np.all(np.isfinite(results)))
-
     def test_inpaint_all_masked_valid(self):
         """All pixels masked should still return valid result"""
         test_image = np.ones((20, 20), dtype=np.float64) * 0.5
@@ -490,10 +471,11 @@ class DiffusionTestCase(TestCase):
         self.assertTrue(np.isfinite(inpainted).all())
         self.assertLess(np.abs(inpainted).max(), 100.0)
 
-    def test_inpaint_noise_method_still_works(self):
-        """init_method='noise' remains functional: results stay finite and
-        bounded near the background level for a single masked pixel (no runaway
-        overshoot once the fill is no longer clipped)."""
+    def test_inpaint_noise_method(self):
+        """init_method='noise' seeds a single masked pixel stochastically,
+        so different seeds give seed-to-seed variation that is preserved (not
+        flattened by a smoothing band), while staying finite and bounded near
+        the background level once the fill is no longer clipped."""
         test_image = np.ones((50, 50), dtype=np.float64) * 0.5
         mask = np.zeros((50, 50), dtype=bool)
         mask[25, 25] = True
@@ -505,8 +487,11 @@ class DiffusionTestCase(TestCase):
             )
             results.append(result[25, 25])
 
-        self.assertTrue(np.isfinite(np.array(results)).all())
-        self.assertLess(np.abs(np.array(results) - 0.5).max(), 0.2)
+        results = np.asarray(results)
+        self.assertTrue(np.isfinite(results).all())
+        self.assertLess(np.abs(results - 0.5).max(), 0.2)
+        # The noise init contributes real per-seed structure.
+        self.assertGreater(np.std(results), 0.01)
 
     def test_inpaint_radial_rise_brightness_profile(self):
         """init_method='radial_rise' seeds the mask with a radial brightness

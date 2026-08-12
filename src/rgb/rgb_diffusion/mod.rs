@@ -71,7 +71,7 @@ wrappers, and `src/rgb.rs` re-exports exactly the three functions below.
 
 | File | What lives here | Why it is separate |
 |------|-----------------|--------------------|
-| `kernel.rs` | `IsotropyType`, `RotationMatrix`, `Flat3Matrix`, `find_gradients`, `isotrop_laplacian`, `rotation_matrix_*`, `build_matrix`, `compute_kernel`, `diffusion_compute`, `CellIter`, `heat_pde_diffusion`, `compute_anisotropy_factor`, `check_isotropy_mode`, `H` | Pure per-pixel/neighbourhood PDE math; no orchestration, no allocation policy, no filter logic. The bit-exact scoped/full-scan worker lives here. |
+| `kernel.rs` | `IsotropyType`, `Flat3Matrix`, `find_gradients`, `isotrop_laplacian`, `compute_basis`, `direction_derivative`, `diffusion_compute`, `CellIter`, `heat_pde_diffusion`, `compute_anisotropy_factor`, `check_isotropy_mode`, `H` | Pure per-pixel/neighbourhood PDE math; no orchestration, no allocation policy, no filter logic. The shared scoped/full-scan worker lives here. |
 | `bspline.rs` | `_bspline_vertical_pass`, `_bspline_horizontal_tap`, `decompose_2d_bspline`, `equivalent_sigma_at_step`, `num_steps_to_reach_equivalent_sigma`, `B_SPLINE_FILTER_F64`, `B_SPLINE_SIGMA` | Self-contained separable B-spline wavelet decomposition and its scale math; all filter constants colocated. |
 | `diffusion.rs` | `ProcessArgs`, `wavelets_process`, `process_image`, `MAX_NUM_SCALES`, `KAPPA` | The high-level inpainting pipeline: buffer ping-pong, scale derivation, iteration loop, and the call into kernel/bspline. |
 | `regions.rs` | `Component`, `ScopedRegions`, `ScopedPlan`, `find_components`, `bfs_nearest_value`, `seed_nearest_dist`, `compute_decomp_region`, `build_scoped_regions`, `decide_scoping`, `NEIGHBORS` | Connected-component / BFS / scoping primitives shared by fills, star and diffusion. |
@@ -82,9 +82,9 @@ wrappers, and `src/rgb.rs` re-exports exactly the three functions below.
 
 Start in `mod.rs`: read the three wrapper signatures (the public contract), then
 the inpainting docstrings. Next read `diffusion.rs::process_image` (the
-orchestration loop), then `kernel.rs::heat_pde_diffusion` / `diffusion_compute`
-(the bit-exact heavy branch), then `bspline.rs::decompose_2d_bspline` (the
-wavelet step), and finally `regions.rs` for scoping. For star colour, read
+top-level pipeline loop), then `kernel.rs::heat_pde_diffusion` /
+`diffusion_compute` (the per-pixel worker), then `bspline.rs::decompose_2d_bspline`
+(the wavelet step), and finally `regions.rs` for scoping. For star colour, read
 `star.rs::fill_star_colour` and its three helpers.
 
 ## Dependency / call-graph diagram
@@ -95,13 +95,13 @@ wavelet step), and finally `regions.rs` for scoping. For star colour, read
         │           │               │                  │
  diff_gray_image   inpaint_mask   (seed)        reconstruct_star_color
         │           │    │          │                  │
-        │           │    │   fills::{fill_masked_*,   │
+        │           │    │   fills::{fill_masked_*,    │
         │           │    │   replace_masked_with_noise,│
-        │           │    │   validate_noise_masked}   │
-        └───────────┴───► diffusion::{                star::fill_star_colour
-          diffusion::process_image   process_image,   ├─ estimate_star_linear_colour
-               │                     wavelets_process}├─ build_colour_curve
-               │                        │             └─ lookup_ab_curve
+        │           │    │   validate_noise_masked}    │
+        └───────────┴───► diffusion::{                 star::fill_star_colour
+          diffusion::process_image   process_image,    ├─ estimate_star_linear_colour
+               │                     wavelets_process} ├─ build_colour_curve
+               │                        │              └─ lookup_ab_curve
                │                  ┌─────┴───────┐
                │             kernel::        bspline::
                │             heat_pde_       decompose_2d_bspline /
@@ -122,38 +122,32 @@ Submodule dependency edges:
 ```
 */
 extern crate openblas_src;
-mod kernel;
 mod bspline;
 mod diffusion;
-mod regions;
 mod fills;
+mod kernel;
+mod regions;
 mod star;
 
-use log;
-use ndarray::Array3;
-use pyo3::prelude::*;
-use pyo3::exceptions::PyValueError;
-use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use crate::rgb::color_spaces::oklab_to_linear_rgb;
 use diffusion::{process_image, ProcessArgs};
-use fills::{fill_masked_from_boundary, fill_masked_radial_rise, replace_masked_with_noise, validate_noise_masked};
+use fills::{
+    fill_masked_from_boundary, fill_masked_radial_rise, replace_masked_with_noise,
+    validate_noise_masked,
+};
+use log;
+use ndarray::Array3;
+use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use star::fill_star_colour;
 
-/// Apply anisotropic diffusion to a grayscale image using multi-scale
-/// B-spline wavelet decomposition and PDE-based diffusion.
+/// Apply multi-scale anisotropic (edge-preserving) diffusion to a grayscale
+/// image.
 ///
-/// This function implements the heat equation with variable diffusion
-/// coefficients controlled by image structure tensors:
-///
-///     ∂u/∂t = ∇·(c(x,y,∇u)∇u)
-///
-/// where c(x,y,∇u) = exp(-|∇u| * anisotropy) is the diffusion coefficient.
-/// High gradient regions (edges) have low diffusion coefficients, preserving
-/// edges while smoothing flat regions.
-///
-/// The algorithm uses a four-derivative approach to capture directional
-/// information in both gradient and Laplacian domains, providing superior
-/// edge preservation compared to isotropic diffusion.
+/// Diffuses the image toward a smooth field while keeping edges sharp, using a
+/// heat-PDE over a B-spline wavelet decomposition (see the module docs for the
+/// underlying math).
 ///
 /// Parameters
 /// ----------
@@ -210,21 +204,6 @@ use star::fill_star_colour;
 /// `ValueError`
 ///     If image dimensions are not positive.
 ///     If image contains NaN or infinite values.
-///
-/// Notes
-/// -----
-/// The B-spline wavelet decomposition uses a 5-tap binomial filter
-/// approximating Gaussian convolution:
-///
-///     [1/16, 4/16, 6/16, 4/16, 1/16]
-///
-/// This provides multi-scale analysis where high-frequency components
-/// capture details and low-frequency components capture smooth variations.
-///
-/// The diffusion coefficient computation from structure tensor eigenvalues
-/// ensures edge preservation:
-///
-///     c = exp(-|∇u| * anisotropy)
 ///
 /// See Also
 /// --------
@@ -291,10 +270,10 @@ pub fn diffuse_gray_image<'py>(
 
 /// Inpaint masked regions in a grayscale image using anisotropic diffusion.
 ///
-/// First replaces masked regions with Gaussian noise (mean=original pixel
-/// value, std=original pixel value), then applies anisotropic diffusion
-/// while respecting mask boundaries. The diffusion process smooths the
-/// inpainted region while maintaining consistency with surrounding pixels.
+/// The masked pixels are first seeded — how they are initialized is controlled
+/// by ``init_method`` (default ``"boundary_fill"``) — and then the whole mask
+/// is diffused so the inpainted region blends smoothly and consistently with
+/// the surrounding pixels.
 ///
 /// Parameters
 /// ----------
@@ -450,7 +429,10 @@ pub fn inpaint_mask<'py>(
             mask_array.dim()
         )));
     }
-    if !matches!(init_method, "noise" | "none" | "radial_rise" | "boundary_fill") {
+    if !matches!(
+        init_method,
+        "noise" | "none" | "radial_rise" | "boundary_fill"
+    ) {
         return Err(PyValueError::new_err(format!(
             "unsupported init_method {init_method:?}; expected one of \
              \"noise\", \"none\", \"radial_rise\", \"boundary_fill\""

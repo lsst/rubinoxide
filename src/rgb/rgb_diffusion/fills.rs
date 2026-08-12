@@ -48,25 +48,18 @@ const EDGE_BLEND_RAMP: f64 = 3.0;
 /// Small positive floor for a non-positive standard deviation / noise samples.
 const EPS: f64 = 1e-6;
 
-/// Replace masked pixels with Gaussian noise for inpainting initialization
+/// Seed masked pixels with Gaussian noise.
 ///
-/// Substitutes masked region pixels with values sampled from a Gaussian
-/// distribution centered at the original pixel value with standard
-/// deviation equal to the original value. This provides a stochastic
-/// starting point for subsequent diffusion-based inpainting.
-///
-/// # Arguments
-/// * `image` - Input image (contains original pixel values)
-/// * `mask` - Boolean mask indicating pixels to replace (True = replace)
-///
-/// # Returns
-/// * `Array2<T>` - Image with masked pixels replaced by noise
+/// Each masked pixel is replaced with a sample from a Gaussian whose mean and
+/// standard deviation are both the original pixel value, giving the diffusion a
+/// starting value. Unmasked pixels are left unchanged.
 ///
 /// # Panics
-/// Panics if any masked pixel has value <= 0, as this would make
-/// the standard deviation non-positive for `Normal::new()`. Callers using
-/// `init_method="noise"` should validate via [`validate_noise_masked`] (which
-/// raises a `PyValueError`) before calling this.
+/// Panics if any masked pixel has value `<= 0`, since that would give a
+/// non-positive standard deviation for `Normal::new()`. Unlike
+/// [`fill_masked_from_boundary`], this does not tolerate negative values, so
+/// callers should first check with [`validate_noise_masked`], which raises a
+/// `PyValueError` instead of panicking.
 pub(super) fn replace_masked_with_noise<T: NdFloat + Default>(
     image: ArrayView2<T>,
     mask: &ArrayView2<bool>,
@@ -96,14 +89,11 @@ where
     result
 }
 
-/// Fill the masked pixels of `comp` in `result`.
-///
-/// Builds summed-area tables (count/sum/sum-of-squares) and a multi-source BFS
-/// of the nearest unmasked value only over the component's bounding box padded
-/// by `radius`. Each masked pixel's mean and std come from the equal-weight
-/// window statistics; a window containing no unmasked neighbor falls back to
-/// the BFS nearest value. Cost scales with the component's bounding box, not
-/// the full image, so many small regions stay cheap.
+/// Fill one connected component of masked pixels; see [`fill_masked_from_boundary`]
+/// for the algorithm. Builds summed-area tables (count/sum/sum-of-squares) and a
+/// multi-source BFS of the nearest unmasked value, both over the component's
+/// bounding box padded by `radius`. Cost scales with the bounding box, not the
+/// full image, so many small regions stay cheap.
 fn fill_component<T: NdFloat + Default>(
     result: &mut Array2<T>,
     image: ArrayView2<T>,
@@ -167,8 +157,7 @@ fn fill_component<T: NdFloat + Default>(
     // where the window holds few valid unmasked samples, which would inject too
     // much noise there. Instead fill every masked pixel with the local mean plus
     // a noise term whose magnitude is a single robust (median) standard
-    // deviation for the component, so the fill reproduces the background's
-    // natural per-pixel noise character throughout.
+    // deviation for the component (see [`fill_masked_from_boundary`]).
     let n = comp.coords.len();
     let mut means = Vec::<T>::with_capacity(n);
     let mut sigmas = Vec::<T>::with_capacity(n);
@@ -237,35 +226,26 @@ fn fill_component<T: NdFloat + Default>(
 
 /// Fill masked pixels from boundary-consistent values plus texture noise.
 ///
-/// For each masked pixel, the mean is the equal-weight average of unmasked
-/// neighbors within `radius`, computed in `O(1)` per pixel via summed-area
-/// tables. Masked pixels whose `radius` window contains no unmasked neighbor
-/// fall back to the nearest unmasked value obtained from a multi-source BFS.
+/// Each masked pixel's mean is the equal-weight average of the unmasked
+/// neighbors within `radius`, computed in O(1) per pixel via summed-area tables.
+/// Masked pixels whose `radius` window holds no unmasked neighbor fall back to
+/// the nearest unmasked value from a multi-source BFS.
 ///
-/// The added texture noise reproduces the background's natural per-pixel noise:
-/// every masked pixel is filled with its local mean plus a Gaussian sample whose
-/// standard deviation is a single robust (median) estimate of the local texture
-/// spread for the component, so the fill has the same noise character as the
-/// surroundings without a mottled rim. Only the outermost few pixels are blended
-/// smoothly into the boundary (the noise is scaled to zero there and ramps back
-/// to full strength within a couple of pixels).
+/// The added texture reproduces the background's natural per-pixel noise: every
+/// masked pixel is filled with its local mean plus a Gaussian sample. Rather
+/// than each pixel's own local standard deviation (which is inflated near the
+/// mask edge, where the window holds few unmasked samples, and would leave a
+/// mottled rim), a single robust median of the component's local standard
+/// deviations is used for every pixel in that component. Only the outermost few
+/// pixels are blended smoothly into the boundary — the noise is scaled to zero
+/// there and ramps back to full strength within a couple of pixels.
 ///
-/// Work is scoped per connected component of the mask, so the cost scales with
-/// the masked footprint (bounding boxes) rather than the full image.
-///
-/// Values are sampled as `Normal(mean, max(sigma, EPS))` where `EPS` is a
-/// small positive floor that prevents a non-positive standard deviation.
-/// Unlike `replace_masked_with_noise`, values may be negative without
-/// panicking and a single RNG is used so the whole mask gets varied texture.
-///
-/// # Arguments
-/// * `image` - Input image (contains original pixel values)
-/// * `mask` - Boolean mask indicating pixels to replace (True = replace)
-/// * `radius` - Search radius (in pixels) for the local mean/std window
-/// * `random_seed` - Optional seed for reproducible output
-///
-/// # Returns
-/// * `Array2<T>` - Image with masked pixels replaced by boundary-fill values
+/// Values are sampled as `Normal(mean, max(sigma, EPS))`, where `EPS` is a small
+/// positive floor that prevents a non-positive standard deviation. Unlike
+/// [`replace_masked_with_noise`], values may be negative without panicking, and
+/// a single RNG is shared across the whole mask so the texture varies across the
+/// region. Work is scoped per connected component, so cost grows with the masked
+/// footprint rather than the whole image.
 pub(super) fn fill_masked_from_boundary<T: NdFloat + Default>(
     image: ArrayView2<T>,
     mask: &ArrayView2<bool>,

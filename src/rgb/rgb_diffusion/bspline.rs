@@ -28,40 +28,54 @@ are permitted provided that the following conditions are met:
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Self-contained separable B-spline wavelet decomposition and its scale math,
-//! with all filter constants colocated.
+//! Separable B-spline wavelet decomposition and its scale math.
+//!
+//! The core idea is [`B_SPLINE_FILTER_F64`], a 5-tap binomial filter
+//! (`[1,4,6,4,1]/16`) that blurs the image like a small Gaussian. Each pixel
+//! is split into a smooth low-frequency part (`lf`) and the leftover
+//! high-frequency detail (`hf = input - lf`); because the filter weights sum
+//! to 1, `lf + hf` reconstructs the input exactly. Blurring is separable: a
+//! vertical pass followed by a horizontal one gives a 2D blur. Each
+//! decomposition level widens the blur by using `mult = 1<<scale` as the tap
+//! spacing, so higher scales smooth over larger regions.
+//!
+//! For picking how many levels to run, [`equivalent_sigma_at_step`] converts a
+//! step count into a Gaussian width and [`num_steps_to_reach_equivalent_sigma`]
+//! does the reverse; see those docs for the exact scale math.
 
 use ndarray::{ArrayViewMut2, NdFloat};
 use std::cmp;
 
-/// 5-tap binomial B-spline filter approximating Gaussian convolution.
+/// 5-tap binomial B-spline filter approximating Gaussian convolution:
+/// `[1/16, 4/16, 6/16, 4/16, 1/16]`. Its weights sum to 1, so the blurred
+/// result is a weighted mean (this is what makes `lf + hf` exact). The single
+/// canonical description of this filter lives here.
 const B_SPLINE_FILTER_F64: [f64; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
 
-/// Base standard deviation of a single B-spline decomposition step.
+/// Standard deviation, in pixels, of one B-spline step at `scale = 0`. Higher
+/// scales widen the blur via the `mult` tap spacing (see
+/// [`_bspline_vertical_pass`]).
 pub(super) const B_SPLINE_SIGMA: f64 = 2.0553651328015339;
 
-/// Perform vertical B-spline convolution pass on image
+/// Vertical-only B-spline blur pass.
 ///
-/// Applies a 5-tap binomial filter [1,4,6,4,1]/16 to convolve the image
-/// vertically at a multi-scale level determined by `mult`. The results
-/// are written to the output buffer.
-///
-/// The B-spline filter approximates Gaussian convolution with:
-/// [1/16, 4/16, 6/16, 4/16, 1/16]
-///
-/// Every pixel (masked and unmasked) contributes to the low-pass, so `lf` is a
-/// smooth, boundary-continuous field that spans the mask region.
+/// Blurs the column containing `row` by applying the filter (see
+/// [`B_SPLINE_FILTER_F64`]) with tap spacing `mult`, so the five samples land
+/// at `row ± mult` and `row ± 2*mult`, clamped to the image edges. Every pixel
+/// (masked or not) contributes, so the result is a smooth field spanning the
+/// mask. Writes the blurred value for columns `col_lo..=col_hi` into `out_buf`
+/// rather than the whole row, so the caller can restrict work to a bounding
+/// region (see [`decompose_2d_bspline`]).
 ///
 /// # Arguments
 /// * `in_array` - Input image array
 /// * `row` - Current row being processed
 /// * `height` - Image height
-/// * `mult` - Multiplier for filter support (1<<scale level)
+/// * `mult` - Tap spacing (1<<scale level)
 /// * `clip_negatives` - If true, clamp negative results to zero
 /// * `out_buf` - Output buffer (length = width), receives filtered row
 /// * `filter` - The 5-tap binomial filter coefficients
-/// * `col_lo`, `col_hi` - Inclusive range of output columns to fill (the
-///   vertical pass may be limited to a bounding region of the row).
+/// * `col_lo`, `col_hi` - Inclusive range of output columns to fill
 #[inline]
 fn _bspline_vertical_pass<T: NdFloat + Default>(
     in_array: ArrayViewMut2<T>,
@@ -84,7 +98,6 @@ fn _bspline_vertical_pass<T: NdFloat + Default>(
     ];
 
     for index in col_lo..=col_hi {
-        // The 5-tap filter weights sum to 1, so the weighted sum is the mean.
         let val_sum = filter.iter().enumerate().fold(T::default(), |acc, (k, &f)| {
             acc + in_array[(indicies[k], index)] * f
         });
@@ -96,18 +109,18 @@ fn _bspline_vertical_pass<T: NdFloat + Default>(
     }
 }
 
-/// Perform one horizontal B-spline convolution tap on a 1D slice
+/// Single-tap horizontal B-spline blur at one column.
 ///
-/// Applies a 5-tap binomial filter to convolve horizontally. This is the
-/// single-tap counterpart to [`_bspline_vertical_pass`]: the vertical pass
-/// writes a whole filtered row into `out_buf`, whereas this computes one
-/// filtered value at `col` from an already-vertical-filtered row slice.
+/// Like [`_bspline_vertical_pass`] but for one value: blurs `in_slice` at
+/// `col` using the filter taps `col ± mult` and `col ± 2*mult`, clamped to the
+/// row's edges. It computes one filtered value at `col` from an
+/// already-vertical-filtered row slice, instead of filling a whole row.
 ///
 /// # Arguments
 /// * `in_slice` - 1D input array (row to filter)
 /// * `col` - Current column position
 /// * `width` - Array width
-/// * `mult` - Multiplier for filter support (1<<scale)
+/// * `mult` - Tap spacing (1<<scale)
 /// * `clip_negatives` - If true, clamp negative results to zero
 ///
 /// # Returns
@@ -141,15 +154,14 @@ fn _bspline_horizontal_tap<T: NdFloat + Default>(
     }
 }
 
-/// Decompose image into high/low frequency components using 2D B-spline
+/// Decompose image into high/low-frequency components using 2D B-spline blur.
 ///
-/// Performs separable B-spline wavelet decomposition by applying
-/// vertical then horizontal passes. Produces high-frequency (detail)
-/// and low-frequency (approximation) components.
-///
-/// The low-pass includes every pixel (masked and unmasked), so `lf` is a smooth
-/// field spanning the mask region with the (filled) values rather than going to
-/// zero deep inside the mask.
+/// Runs a vertical pass then a horizontal pass (both with the same `mult`) to
+/// produce a smooth low-frequency image `lf` and the detail `hf = input - lf`.
+/// The low-pass includes every pixel — masked or not — so `lf` stays a smooth
+/// field across the mask (reflecting the surrounding values) rather than
+/// collapsing toward zero deep inside it. `lf + hf` reconstructs the input
+/// exactly.
 ///
 /// # Arguments
 /// * `in_array` - Input image (modified in-place for efficiency)
@@ -157,7 +169,7 @@ fn _bspline_horizontal_tap<T: NdFloat + Default>(
 /// * `lf` - Low-frequency output array (approximation)
 /// * `width` - Image width
 /// * `height` - Image height
-/// * `mult` - Scale multiplier (1<<scale)
+/// * `mult` - Tap spacing (1<<scale)
 /// * `row_buf` - Reusable buffer for vertical pass results
 /// * `region` - Optional inclusive `(r0, r1, c0, c1)` bounding region over which
 ///   to run the decomposition. `None` runs the legacy full-image path (all rows
@@ -216,10 +228,18 @@ pub(super) fn decompose_2d_bspline<T: NdFloat + Default>(
     }
 }
 
-/// Compute equivalent standard deviation at wavelet decomposition step
+/// Cumulative Gaussian width after `s` B-spline steps.
 ///
-/// Calculates the cumulative Gaussian width after `s` steps of B-spline
-/// decomposition. Each step doubles the effective scale.
+/// The canonical scale math: step `0` is just the base `sigma`. Each later
+/// step widens the blur by a Gaussian of width `2^s · sigma`, combined with the
+/// running total by adding their squares (in quadrature):
+///
+/// ```text
+/// sigma_s = sqrt(sigma_{s-1}^2 + (2^s · sigma)^2)
+/// ```
+///
+/// Because the squares add, the width grows faster than a plain linear sum of
+/// the base sigma. [`num_steps_to_reach_equivalent_sigma`] inverts this.
 ///
 /// # Arguments
 /// * `sigma` - Base standard deviation (B_SPLINE_SIGMA)
@@ -238,16 +258,13 @@ pub(super) fn equivalent_sigma_at_step<T: NdFloat + Default>(sigma: T, s: usize)
     }
 }
 
-/// Calculate number of wavelet decomposition steps for target sigma
+/// Number of B-spline steps needed to reach a target Gaussian width.
 ///
-/// Determines how many B-spline decomposition levels are needed
-/// to achieve a specified effective smoothing scale.
-///
-/// The accumulated effective sigma follows the same squared-additive semantics
-/// as [`equivalent_sigma_at_step`]: each step adds the *square* `(2^s * sigma)^2`
-/// of the additional scale (not the linear `2^s * sigma`). Keeping the two
-/// functions consistent means the same `s` steps produce the same equivalent
-/// sigma in both.
+/// Uses the same add-in-quadrature scale math as
+/// [`equivalent_sigma_at_step`] (each step adds `2^s · sigma` in quadrature),
+/// so walking `s` upward with the same rule keeps both functions consistent.
+/// Returns the smallest step count whose cumulative width reaches
+/// `sigma_final`.
 ///
 /// # Arguments
 /// * `sigma_filter` - Base filter standard deviation
@@ -294,55 +311,40 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_vertical_spans_mask() {
-        // v1.1: the vertical pass includes every pixel in the low-pass (masked
-        // or not), so `lf` spans the mask. A masked 1000.0 block now contributes
-        // to lf above it and dominates lf deep inside it (not forced to 0).
-        let mut test_img = Array2::<f64>::zeros((7, 7));
-        test_img.fill(1.0);
+    fn test_bspline_vertical() {
+        // The vertical pass includes every pixel (masked or not), so:
+        // (a) a masked 1000.0 block contributes to the low-pass above it and
+        // dominates it deep inside (not forced to 0), and
+        // (b) a constant field returns the constant.
+        let mut out_buf = vec![0.0_f64; 7];
+        let mut img = Array2::<f64>::zeros((7, 7));
         for r in 2..=4 {
             for c in 2..=4 {
-                test_img[(r, c)] = 1000.0;
+                img[(r, c)] = 1000.0;
             }
         }
-        let mut out_buf = vec![0.0_f64; 7];
-
         // Row 1, col 3 (inside the block's columns): blurred above by the 1000s.
-        _bspline_vertical_pass(test_img.view_mut(), 1, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
+        _bspline_vertical_pass(img.view_mut(), 1, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
         assert!(out_buf[3] > 1.0, "masked values should contribute to lf, got {}", out_buf[3]);
-
         // Deep in the block (row 3, col 3) lf reflects the high fill values.
-        _bspline_vertical_pass(test_img.view_mut(), 3, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
+        _bspline_vertical_pass(img.view_mut(), 3, 7, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 6);
         assert!(out_buf[3] > 700.0, "deep-masked lf should reflect fill values, got {}", out_buf[3]);
+        // Constant field: the vertical blur returns the constant.
+        let mut const_img = Array2::<f64>::from_elem((3, 3), 42.0);
+        let mut out3 = vec![0.0_f64; 3];
+        _bspline_vertical_pass(const_img.view_mut(), 1, 3, 1, false, &mut out3, &B_SPLINE_FILTER_F64, 0, 2);
+        assert_delta!(out3[0], 42.0, 1e-10);
     }
 
     #[test]
-    fn test_bspline_horizontal_includes_all() {
-        // v1.1: the horizontal pass includes every column (masked or not), so a
+    fn test_bspline_horizontal() {
+        // The horizontal pass includes every column (masked or not), so a
         // constant row returns the constant at any position.
-        let mut row = vec![0.0_f64; 7];
-        for c in 0..7 {
-            row[c] = 1.0;
-        }
-
+        let row = vec![1.0_f64; 7];
         let result1 = _bspline_horizontal_tap(&row, 1, 7, 1, false, &B_SPLINE_FILTER_F64);
         assert_delta!(result1, 1.0, 1e-10);
-
         let result2 = _bspline_horizontal_tap(&row, 3, 7, 1, false, &B_SPLINE_FILTER_F64);
         assert_delta!(result2, 1.0, 1e-10);
-    }
-
-    #[test]
-    fn test_bspline_vertical_includes_masked() {
-        // v1.1: all pixels are included in the vertical low-pass (masked pixels
-        // were previously excluded, giving 0 when every neighbor was masked).
-        // A constant image returns the constant.
-        let mut img = Array2::<f64>::zeros((3, 3));
-        img.fill(42.0);
-        let mut out_buf = vec![0.0_f64; 3];
-
-        _bspline_vertical_pass(img.view_mut(), 1, 3, 1, false, &mut out_buf, &B_SPLINE_FILTER_F64, 0, 2);
-        assert_delta!(out_buf[0], 42.0, 1e-10);
     }
 
     #[test]

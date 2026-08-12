@@ -28,8 +28,29 @@ are permitted provided that the following conditions are met:
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Connected-component and nearest-value helpers used to scope the diffusion
-//! and B-spline decomposition to masked image regions.
+//! Region and connectivity primitives that let the diffusion and B-spline
+//! decomposition touch only the image cells they actually need.
+//!
+//! # Scoping
+//!
+//! "Scoping" means restricting expensive work to the masked image cells plus the
+//! cells around them. A masked cell runs the heavy diffusion branch; the
+//! unmasked cells next to it (within a radius called `mult`) just supply the
+//! correct neighbour values that masked cell reads. Together these two groups
+//! are a **scoped region** (a mask "plus its halo"). Cells far from any masked
+//! cell are never read and are left at their pre-seeded values, so leaving them
+//! untouched is exact. The helpers in this module find masked regions
+//! (`find_components`) and build these scoped regions at every scale
+//! (`build_scoped_regions` / `decide_scoping`).
+//!
+//! # Distances and neighbourhoods
+//!
+//! Everything here works on the 8-connected neighbourhood ([`NEIGHBORS`]): a
+//! cell's eight neighbours (up/down, left/right, and the four diagonals). The
+//! distance between two cells is the smallest number of 8-neighbour steps needed
+//! to reach one from the other (a Chebyshev / max-norm distance). A multi-source
+//! BFS seeded at every masked cell computes these distances for all cells at
+//! once, growing the distance by 1 per neighbour step.
 
 use ndarray::{Array2, ArrayView2, NdFloat};
 use std::collections::VecDeque;
@@ -37,8 +58,9 @@ use std::collections::VecDeque;
 /// Masked-fraction above which mask scoping is deemed not to reduce work, so
 /// `process_image` falls back to the legacy full-scan / zeros-seed path.
 const MAX_MASKED_FRACTION: f64 = 0.2;
-/// Largest masked∪halo fraction above which scoping is deemed not to reduce
-/// work (halos merged to fill the frame), so we fall back to the full-scan path.
+/// Largest masked-plus-halo fraction above which scoping is deemed not to
+/// reduce work (halos merge to fill the frame), so we fall back to the
+/// full-scan path.
 const MAX_HALO_FRACTION: f64 = 0.5;
 /// Decomposition-region area (as a fraction of the image) above which scoping
 /// the forward B-spline does not pay, so it falls back to a full decomposition.
@@ -66,34 +88,31 @@ pub(super) struct Component {
     pub(super) coords: Vec<(usize, usize)>,
 }
 
-/// Per-scale masked∪halo linear indices (row-major idx = r*width+c) for scoped
-/// diffusion.
+/// Per-scale scoped regions for diffusion: the masked cells plus their halo.
 ///
-/// When a mask is present, `heat_pde_diffusion` needs to touch only the masked
-/// cells (which run the heavy fill branch) plus the unmasked halo cells within a
-/// Chebyshev distance `mult` of some masked cell (which read the 3x3
-/// neighborhood of masked pixels and so must hold correct `hf + lf` values).
-/// Far-field unmasked cells are never read by any masked pixel and can be left
-/// as their pre-seeded clone value.
+/// See the module doc for what a scoped region (mask plus halo) is. For each
+/// scale `s`, `halo[s]` lists, as linear indices (`idx = r*width + c`), every
+/// cell within distance `mult = 1<<s` of some masked cell — which includes the
+/// masked cells themselves. Far-field unmasked cells appear in no halo because
+/// no masked pixel reads them.
 pub(super) struct ScopedRegions {
     pub(super) width: usize,
-    /// halo[scale] = masked cells ∪ Chebyshev(mult=1<<scale) neighborhood, as
-    /// linear indices (idx = r*width+c).
+    /// `halo[scale]` = masked cells plus their distance-`1<<scale` (Chebyshev /
+    /// max-norm) halo, as linear indices (`idx = r*width + c`).
     pub(super) halo: Vec<Vec<usize>>,
 }
 
-/// Compute the single padded bounding region over which the FORWARD B-spline
-/// decomposition must run so that every cell `heat_pde_diffusion` reads
-/// (masked ∪ read-halo, Stage 1) reproduces the full-image lf/hf exactly.
+/// Bounding box over which the forward B-spline decomposition must run so every
+/// cell the diffusion reads reproduces the full-image result exactly.
 ///
-/// Stage 2 scopes the forward decomposition to a single fixed region used for
-/// ALL scales. Its padding is CUMULATIVE: at the coarsest scale the separable
-/// 5-tap B-spline spans `2 * mult_s = 2 * 2^s` pixels on each side, and because
-/// each scale's `in` is itself a blurred version of the previous, the total
-/// half-width a cell's value can depend on is `max_mult + Σ_{s=1}^{scales-1}
-/// 2*mult_s` (with `max_mult = 1<<(scales-1)`). Padding the masked bounding box
-/// by that cumulative radius reproduces the full-image low/high frequencies at
-/// every cell heat_pde reads, so the inverse stage and output are correct.
+/// Each scale's input is a blurred version of the previous one, so a cell's
+/// value at the coarsest scale depends on cells whose distance accumulates
+/// across scales. The separable 5-tap B-spline spans `2 * mult_s = 2 * 2^s`
+/// pixels on each side at scale `s`, so the total half-width a cell's value can
+/// depend on is `max_mult + Σ_{s=1}^{scales-1} 2*mult_s` (with
+/// `max_mult = 1<<(scales-1)`). Padding the masked bounding box by this
+/// cumulative radius reproduces the full-image low/high frequencies at every
+/// cell the diffusion reads, so the inverse stage and output are correct.
 ///
 /// Returns `None` (fall back to the full decomposition) when the resulting
 /// region would cover more than half the image (scoping would not reduce work),
@@ -152,19 +171,18 @@ pub(super) fn compute_decomp_region(
     Some((r0, r1, c0, c1))
 }
 
-/// Build the per-scale masked∪halo cell lists for scoped diffusion.
+/// Build the per-scale scoped regions (masked cells plus halo) for diffusion.
 ///
-/// Computes a Chebyshev (max-norm) distance transform via a multi-source
-/// 8-connected BFS seeded at every masked pixel (distance 0 at masked cells,
-/// growing by 1 per 8-neighbor step outward). For each scale `s`, `halo[s]`
-/// holds every cell with `dist <= 1<<s`, which necessarily includes the masked
-/// cells and their `mult`-Chebyshev halo.
+/// Uses a single multi-source 8-connected BFS seeded at every masked cell
+/// (distance 0) to compute each cell's distance to the nearest masked cell, as
+/// described in the module doc. For each scale `s`, `halo[s]` holds every cell
+/// with `dist <= 1<<s`, which necessarily includes the masked cells and their
+/// halo.
 ///
-/// The BFS is bounded to `max_mult = 1 << (scales-1)`: no halo ever includes a
-/// cell whose Chebyshev distance exceeds `max_mult`, so cells beyond that radius
-/// are irrelevant and never expanded. This keeps the cost proportional to the
-/// `masked ∪ halo(max_mult)` footprint (tiny for sparse masks) rather than the
-/// full image, while producing the exact same halo sets as a whole-image scan.
+/// The BFS is bounded to `max_mult = 1 << (scales-1)`, the largest radius any
+/// halo needs, so cells beyond it are never expanded. This keeps the cost
+/// proportional to the (usually tiny) scoped footprint rather than the full
+/// image, while producing the exact same halo sets as a whole-image scan.
 ///
 /// An empty mask yields empty halo rows (the caller short-circuits before
 /// reaching the diffusion, but the structure stays valid for tests).
@@ -230,8 +248,8 @@ pub(super) fn build_scoped_regions(mask: &ArrayView2<bool>, scales: usize) -> Sc
     ScopedRegions { width, halo }
 }
 
-/// A single scoping decision bundling the per-scale masked∪halo regions with
-/// the (optional) region-restricted forward-decomposition bounding box.
+/// A single scoping decision bundling the per-scale scoped regions with the
+/// (optional) bounding box for a region-restricted forward decomposition.
 pub(super) struct ScopedPlan {
     pub(super) regions: ScopedRegions,
     pub(super) decomp_region: Option<(usize, usize, usize, usize)>,
@@ -240,8 +258,9 @@ pub(super) struct ScopedPlan {
 /// Decide whether masked scoping is worthwhile and, if so, build the plan.
 ///
 /// Returns `None` (fall back to the legacy full-scan / full-decomposition path)
-/// when masking is not present, covers too much of the image, or yields halos
-/// that merge to fill the frame. An *empty* (all-false) mask returns `Some` with
+/// when masking is not present, covers too much of the image (more than
+/// [`MAX_MASKED_FRACTION`]), or yields halos that merge to fill the frame (more
+/// than [`MAX_HALO_FRACTION`]). An *empty* (all-false) mask returns `Some` with
 /// empty regions and `decomp_region = None` so `process_image` keeps the
 /// clone-vs-zeros seeding branch (empty mask -> clone pre-seed -> output equals
 /// the input).
@@ -440,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_scoped_regions_membership() {
+    fn test_build_scoped_regions() {
         // A single masked pixel on a non-square (5x3) buffer: check that the
         // mult=1 halo includes the masked cell and a Chebyshev distance-1
         // neighbor, excludes a distance-2 cell, and the mult=2 halo re-includes
@@ -467,16 +486,13 @@ mod tests {
         // Distance-2 cell (4,1) excluded at mult=1, re-included at mult=2.
         assert!(!regions.halo[0].contains(&(4 * w + 1)));
         assert!(regions.halo[1].contains(&(4 * w + 1)));
-    }
 
-    #[test]
-    fn test_build_scoped_regions_empty() {
         // An all-False mask must produce empty halo rows and a valid width.
-        let mask = Array2::<bool>::from_elem((4, 6), false);
-        let regions = build_scoped_regions(&mask.view(), 3);
-        assert_eq!(regions.width, 6);
-        assert_eq!(regions.halo.len(), 3);
-        assert!(regions.halo.iter().all(|h| h.is_empty()));
+        let empty = Array2::<bool>::from_elem((4, 6), false);
+        let eregions = build_scoped_regions(&empty.view(), 3);
+        assert_eq!(eregions.width, 6);
+        assert_eq!(eregions.halo.len(), 3);
+        assert!(eregions.halo.iter().all(|h| h.is_empty()));
     }
 
     #[test]
