@@ -30,7 +30,7 @@ are permitted provided that the following conditions are met:
 extern crate openblas_src;
 use log;
 use ndarray::{Array2, ArrayView2, ArrayViewMut2, NdFloat};
-use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray, PyArray2, PyArrayMethods, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rand;
 use rand::rngs::StdRng;
@@ -1022,7 +1022,7 @@ pub fn diffuse_gray_image<'py>(
         sharpness,
     };
     let result = process_image(process_args, &mut array, None);
-    result.to_pyarray(py)
+    PyArray::from_owned_array(py, result)
 }
 
 /// Replace masked pixels with Gaussian noise for inpainting initialization
@@ -1217,7 +1217,7 @@ pub fn inpaint_mask<'py>(
     };
     let mut masked = replace_masked_with_noise(array, &mask_array, random_seed);
     let result = process_image(process_args, &mut masked.view_mut(), Some(mask_array));
-    result.to_pyarray(py)
+    PyArray::from_owned_array(py, result)
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ are permitted provided that the following conditions are met:
   */
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
@@ -310,7 +310,7 @@ fn fast_rbf_grid_ndarray<'py>(
         powers_view,
     )?;
 
-    Ok(result.to_pyarray(py))
+    Ok(PyArray::from_owned_array(py, result))
 }
 
 pub fn create_rbf_module(parent_module: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -294,18 +294,18 @@ dependencies = [
 
 [[package]]
 name = "lapack-sys"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "447f56c85fb410a7a3d36701b2153c1018b1d2b908c5fbaf01c1b04fac33bcbe"
+checksum = "314b879030845b68571809a6978e52d3b67ac5fba07e77b1b317b484092e2fb5"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "lax"
-version = "0.17.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1048f58cdc36e726e1c5ef81ec7ac9b1be2fce6b705786514b5a4f8c63487867"
+checksum = "5043cf8e975964af8a16080388fc629632630a56916bedc4631b9dc6f8048d28"
 dependencies = [
  "cauchy",
  "katexit",
@@ -385,9 +385,9 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.16.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
+checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
 dependencies = [
  "approx",
  "cblas-sys",
@@ -404,28 +404,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndarray"
-version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
-]
-
-[[package]]
 name = "ndarray-conv"
-version = "0.5.2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "602c13f57fa9415714a0179ba96182fce4dfaf2db80ee6a065e32d5904896ede"
+checksum = "ee3237bc3bd3c0812a13c7e76251f500686db835e7023cd7d6ed7e8d23d6a00f"
 dependencies = [
  "castaway",
- "ndarray 0.16.1",
+ "ndarray",
  "num",
  "realfft",
  "rustfft",
@@ -434,14 +419,14 @@ dependencies = [
 
 [[package]]
 name = "ndarray-linalg"
-version = "0.17.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "820b7fdcc3f1fd48c31f4c85bdefe93ef2d0e8b69ff955c4d499ea6db2f19d44"
+checksum = "eb0783188ff249ab498417e0477f7fade3b312d1d287314ca76de570d9a83ee0"
 dependencies = [
  "cauchy",
  "katexit",
  "lax",
- "ndarray 0.16.1",
+ "ndarray",
  "num-complex",
  "num-traits",
  "rand 0.8.8",
@@ -530,7 +515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a5b15d63a5ff39e378daed0e1340d3a5964703ea9712eb09a0dc66fade996f4"
 dependencies = [
  "libc",
- "ndarray 0.17.2",
+ "ndarray",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -849,7 +834,7 @@ version = "0.1.0"
 dependencies = [
  "blas-src",
  "log",
- "ndarray 0.16.1",
+ "ndarray",
  "ndarray-conv",
  "ndarray-linalg",
  "num-traits",

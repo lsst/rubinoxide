@@ -43,7 +43,7 @@ use ndarray::linalg::general_mat_mul;
 use ndarray::prelude::*;
 use ndarray::{Array1, Array2};
 use ndarray_linalg::Inverse;
-use numpy::{IntoPyArray, PyArray3, PyReadonlyArray3};
+use numpy::{PyArray, PyArray3, PyReadonlyArray3};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
@@ -211,10 +211,12 @@ pub fn RGB_to_Oklab<'py>(
     scratch.map_inplace(|x| *x = x.signum() * x.abs().powf(pow));
     general_mat_mul(1.0, &scratch, &(lms_to_lab.t()), 0.0, &mut output);
 
-    let result_array = output
-        .into_shape_with_order((height, width, depth))
-        .map_err(|_| PyTypeError::new_err("Second reshape failed"))?
-        .into_pyarray(py);
+    let result_array = PyArray::from_owned_array(
+        py,
+        output
+            .into_shape_with_order((height, width, depth))
+            .map_err(|_| PyTypeError::new_err("Second reshape failed"))?,
+    );
 
     Ok(result_array)
 }
@@ -285,10 +287,12 @@ pub fn Oklab_to_RGB<'py>(
     scratch.mapv_inplace(|x| x.powf(3.0));
     general_mat_mul(1.0, &scratch, &(combined.t()), 0.0, &mut output);
 
-    let result_array = output
-        .into_shape_with_order([height, width, depth])
-        .map_err(|_| PyTypeError::new_err("Second reshape failed"))?
-        .into_pyarray(py);
+    let result_array = PyArray::from_owned_array(
+        py,
+        output
+            .into_shape_with_order([height, width, depth])
+            .map_err(|_| PyTypeError::new_err("Second reshape failed"))?,
+    );
 
     Ok(result_array)
 }
