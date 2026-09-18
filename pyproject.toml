@@ -1,24 +1,24 @@
 [build-system]
-requires = ["maturin>=1.8,<2.0"]
+requires = ["maturin>=1.8"]
 build-backend = "maturin"
 
 [project]
 name = "rubinoxide"
 requires-python = ">=3.12"
 description = "Rust accelerated code for astronomical data processing."
-license =  "BSD-3-Clause OR GPL-3.0-or-later"
+license = "BSD-3-Clause OR GPL-3.0-or-later"
 license-files = ["COPYRIGHT", "LICENSE"]
 readme = "README.md"
 authors = [
-    {name="Rubin Observatory Data Management", email="dm-admin@lists.lsst.org"},
+  { name = "Rubin Observatory Data Management", email = "dm-admin@lists.lsst.org" },
 ]
 classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Intended Audience :: Science/Research",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Topic :: Scientific/Engineering :: Astronomy",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dynamic = ["version"]
 
@@ -61,43 +61,41 @@ add-ignore = ["D107", "D105", "D102", "D100", "D200", "D205", "D400", "D104"]
 [tool.ruff]
 line-length = 110
 target-version = "py312"
-exclude = [
-    "__init__.py",
-]
+exclude = ["__init__.py"]
 
 [tool.ruff.lint]
 ignore = [
-    "N802",
-    "N803",
-    "N806",
-    "N812",
-    "N815",
-    "N816",
-    "N999",
-    "D107",
-    "D105",
-    "D102",
-    "D104",
-    "D100",
-    "D200",
-    "D205",
-    "D400",
-    "UP007",  # Allow UNION in type annotation
+  "N802",
+  "N803",
+  "N806",
+  "N812",
+  "N815",
+  "N816",
+  "N999",
+  "D107",
+  "D105",
+  "D102",
+  "D104",
+  "D100",
+  "D200",
+  "D205",
+  "D400",
+  "UP007", # Allow UNION in type annotation
 ]
 select = [
-    "E",  # pycodestyle
-    "F",  # pycodestyle
-    "N",  # pep8-naming
-    "W",  # pycodestyle
-    "D",  # pydocstyle
-    "UP",  # pyupgrade
-    "I",  # isort
-    "RUF022",  # sort __all__
+  "E",      # pycodestyle
+  "F",      # pycodestyle
+  "N",      # pep8-naming
+  "W",      # pycodestyle
+  "D",      # pydocstyle
+  "UP",     # pyupgrade
+  "I",      # isort
+  "RUF022", # sort __all__
 ]
 # Commented out to suppress "unused noqa" in jenkins which has older ruff not
 # generating E721.
 extend-select = [
-    "RUF100", # Warn about unused noqa
+  "RUF100", # Warn about unused noqa
 ]
 
 [tool.ruff.lint.isort]
@@ -115,39 +113,39 @@ docstring-code-format = true
 docstring-code-line-length = 69
 
 [tool.towncrier]
-    package = "lsst.rubinoxide"
-    package_dir = "python"
-    filename = "doc/lsst.rubinoxide/CHANGES.rst"
-    directory = "doc/changes"
-    title_format = "Rubinoxide {version} ({project_date})"
-    issue_format = "`{issue} <https://rubinobs.atlassian.net/browse/{issue}>`_"
+package = "lsst.rubinoxide"
+package_dir = "python"
+filename = "doc/lsst.rubinoxide/CHANGES.rst"
+directory = "doc/changes"
+title_format = "Rubinoxide {version} ({project_date})"
+issue_format = "`{issue} <https://rubinobs.atlassian.net/browse/{issue}>`_"
 
-    [[tool.towncrier.type]]
-        directory = "feature"
-        name = "New Features"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "feature"
+name = "New Features"
+showcontent = true
 
-    [[tool.towncrier.type]]
-        directory = "api"
-        name = "API Changes"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "api"
+name = "API Changes"
+showcontent = true
 
-    [[tool.towncrier.type]]
-        directory = "bugfix"
-        name = "Bug Fixes"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "bugfix"
+name = "Bug Fixes"
+showcontent = true
 
-    [[tool.towncrier.type]]
-        directory = "perf"
-        name = "Performance Enhancement"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "perf"
+name = "Performance Enhancement"
+showcontent = true
 
-    [[tool.towncrier.type]]
-        directory = "misc"
-        name = "Other Changes and Additions"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "misc"
+name = "Other Changes and Additions"
+showcontent = true
 
-    [[tool.towncrier.type]]
-        directory = "removal"
-        name = "An API Removal or Deprecation"
-        showcontent = true
+[[tool.towncrier.type]]
+directory = "removal"
+name = "An API Removal or Deprecation"
+showcontent = true
